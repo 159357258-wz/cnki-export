@@ -229,3 +229,29 @@ CPFD = 会议论文
 ```
 
 **⭐ 脚本会自动从 `data-dbname` 读，不需要手写。**
+
+## 开发验证（不要每次都跑全量）
+
+**⭐ 三个快速开关：**
+
+```bash
+--check-only                          只查环境 + 检索 1 次，不翻页不导出（约 8 秒）
+--reuse-filenames --dry-run           复用上次 filenames.json，跳过收集（约 12 秒）
+--max-pages 2 --dry-run               只翻 2 页（约 12 秒）
+```
+
+**⭐⭐ 按「改了什么」选：**
+
+| 改了什么 | 用什么 |
+|---|---|
+| 检测 / 滑块逻辑 | `--check-only` |
+| 导出逻辑 | `--reuse-filenames --dry-run` |
+| 收集 / 翻页逻辑 | `--max-pages 2 --dry-run` |
+| 真跑 | 全量 |
+
+**⭐⭐★ 纯代码改动（如加检查点、改日志格式）不需要跑浏览器 —— 用静态检查就够：**
+
+```bash
+python -c "import ast; ast.parse(open('scripts/cnki_export.py', encoding='utf-8').read())"
+node --check 拼接后的.mjs
+```

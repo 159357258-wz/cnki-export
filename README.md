@@ -247,3 +247,59 @@ npx skills add <你的用户名>/cnki-export
 **MIT。随便用，但请自己遵守知网的使用条款——不要高频请求，不要绕过验证码。**
 
 **本项目只是把「人工点鼠标的流程」自动化，不破解任何限制。**
+
+---
+
+## 开发验证的三个快速开关
+
+**改 skill 时不用每次跑全量（40—70 秒）。按「改了什么」选模式：**
+
+| 改了什么 | 用什么 | 耗时 |
+|---|---|---|
+| 检测逻辑 / 滑块 | `--check-only` | 约 8 秒 |
+| 导出逻辑 | `--reuse-filenames --dry-run` | 约 12 秒 |
+| 收集逻辑（翻页） | `--max-pages 2 --dry-run` | 约 12 秒 |
+| 真跑一年 | 全量 | 40—70 秒 |
+
+**⭐ `--check-only`**
+
+**只做「打开页面 + 查登录态 + 查滑块 + 检索 1 次」，不翻页不导出。**
+
+```bash
+python scripts/cnki_export.py --journal "中国工业经济" --year 2020 --out F:\data --check-only
+```
+
+**输出：**
+
+```
+① 打开专业检索页
+   textarea 存在: True ｜可见: True
+② 检查机构登录态
+   ✅ 已登录机构: 湖北汽车工业学院
+③ 检查滑块
+   ✅ 没有滑块
+④ 试检索
+   命中: 146 条｜页码: 1/8
+   第 1 页： 20 行，其中 20 条有 data-filename
+✅ 自检通过
+```
+
+**⭐⭐ `--reuse-filenames`**
+
+**复用 `<out>/filenames.json`，跳过收集阶段。改导出逻辑时用。**
+
+```bash
+python scripts/cnki_export.py --journal "中国工业经济" --year 2020 --out F:\data --reuse-filenames --dry-run
+```
+
+**⭐⭐★ `--max-pages N`**
+
+**只翻前 N 页。改收集/翻页逻辑时用。**
+
+```bash
+python scripts/cnki_export.py --journal "中国工业经济" --year 2020 --out F:\data --max-pages 2 --dry-run
+```
+
+**⭐⭐⭐⭐ `--dl-dir`**
+
+**手动指定下载目录（默认从 ego-lite Preferences 读）。**

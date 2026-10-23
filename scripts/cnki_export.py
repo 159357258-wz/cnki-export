@@ -130,9 +130,30 @@ def run_ego(ego, script_path, replacements):
     return r.returncode, (r.stdout or ""), (r.stderr or "")
 
 
-def step1_collect(ego, journal, year, out_dir):
-    """收集全部 filename"""
+def step_check(ego, journal, year, out_dir):
+    """只检查环境：打开页面 + 登录态 + 滑块 + 检索 1 次（约 8 秒）"""
+    print("\n【检查模式】不翻页、不导出")
+    query = "LY='%s' AND YE=%s" % (journal, year)
+    script = os.path.join(os.path.dirname(__file__), "cnki_check.js")
+    if not os.path.isfile(script):
+        raise SystemExit("❗ 缺少 %s" % script)
+    code, out, err = run_ego(ego, script, {"__CNKI_QUERY__": js_str(query)})
+    print(out if out else "(无输出)")
+    if err.strip():
+        print("[stderr]", err[-800:])
+    if code != 0:
+        raise SystemExit("❗ 自检失败（退出码 %d）" % code)
+    return True
+
+
+def step1_collect(ego, journal, year, out_dir, max_pages=0):
+    """收集全部 filename
+
+    max_pages: >0 时只翻前 N 页（开发时用 2 快速验证收集逻辑）
+    """
     print("\n【第 1 步】检索并收集文件名")
+    if max_pages:
+        print("  ⚠️ 只翻前 %d 页（--max-pages）" % max_pages)
     fj = os.path.join(out_dir, "filenames.json")
     query = "LY='%s' AND YE=%s" % (journal, year)
     print("  检索式:", query)
@@ -140,6 +161,7 @@ def step1_collect(ego, journal, year, out_dir):
     code, out, err = run_ego(ego, script, {
         "__CNKI_QUERY__": js_str(query),
         "__CNKI_OUT__": js_str(fj),
+        "const MAX_PAGES = 80;": "const MAX_PAGES = %d;" % (max_pages if max_pages else 80),
     })
     print(out[-2000:] if out else "(无输出)")
     if err.strip():
@@ -288,17 +310,36 @@ def step3_merge(files, journal, year, out_dir):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="知网批量导出（按期刊+年份）")
+    ap = argparse.ArgumentParser(
+        description="知网批量导出（按期刊+年份）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+开发验证的三种快速模式（不跑全量）：
+  --check-only                只做「打开页面 + 查登录态 + 查滑块 + 检索 1 次」，不翻页不导出（约 8 秒）
+  --max-pages 2 --dry-run     只翻 2 页，导出 3 条（约 12 秒）
+  --reuse-filenames --dry-run 复用上次的 filenames.json，跳过收集，直接导出（约 12 秒）
+
+真跑一年：
+  --journal "中国工业经济" --year 2020 --out F:\\data
+""")
     ap.add_argument("--journal", required=True, help="期刊名（与知网「文献来源」字段一致）")
     ap.add_argument("--year", required=True, type=int, help="年份")
     ap.add_argument("--out", required=True, help="输出目录")
     ap.add_argument("--dry-run", action="store_true", help="只导 3 条做自检")
+    ap.add_argument("--max-pages", type=int, default=0,
+                    help="只翻前 N 页（0=全部）。开发时用 2 快速验证收集逻辑")
+    ap.add_argument("--reuse-filenames", action="store_true",
+                    help="复用 <out>/filenames.json，跳过收集阶段。改导出逻辑时用")
+    ap.add_argument("--check-only", action="store_true",
+                    help="只检查：打开页面 + 登录态 + 滑块 + 检索 1 次，不翻页不导出")
+    ap.add_argument("--dl-dir", default="",
+                    help="手动指定下载目录（默认从 ego-lite Preferences 读）")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
 
     ego = find_ego_browser()
-    dl = find_download_dir()
+    dl = args.dl_dir or find_download_dir()
     print("ego-browser:", ego)
     print("下载目录:", dl)
 
@@ -306,17 +347,35 @@ def main():
         raise SystemExit("❗ 找不到下载目录。请先在 ego-lite 里随便下载一个文件，或用 --dl-dir 指定")
     os.makedirs(dl, exist_ok=True)
 
-    data = step1_collect(ego, args.journal, args.year, args.out)
+    # ── 模式 1：只检查（约 8 秒）
+    if args.check_only:
+        print("\n【检查模式】不做翻页、不导出")
+        step_check(ego, args.journal, args.year, args.out)
+        return
+
+    # ── 收集阶段
+    fj = os.path.join(args.out, "filenames.json")
+    if args.reuse_filenames:
+        if not os.path.isfile(fj):
+            raise SystemExit("❗ --reuse-filenames 但 %s 不存在，先跑一次收集" % fj)
+        data = json.load(open(fj, encoding="utf-8"))
+        print("\n【复用】从 %s 读到 %d 条，跳过收集" % (fj, len(data)))
+    else:
+        data = step1_collect(ego, args.journal, args.year, args.out,
+                             max_pages=args.max_pages)
+
+    # ── 导出阶段
     files = step2_export(ego, data, dl, args.out, dry_run=args.dry_run)
 
-    if args.dry_run:
+    if args.dry_run or args.max_pages:
         print("\n自检完成。检查上面是否有「新增 xls」——有就说明流程通了。")
+        if args.max_pages:
+            print("（--max-pages %d 只跑了前 %d 页，不是全量）" % (args.max_pages, args.max_pages))
         return
 
     if len(files) < 1:
         raise SystemExit("❗ 一批都没导出来")
 
-    # 有几批就合并几个（可能缺批）
     expect = (len(data) + BATCH_LIMIT - 1) // BATCH_LIMIT
     if len(files) < expect:
         print("\n⚠️ 预期 %d 批，实际只导到 %d 批 —— 合并结果是部分数据" % (expect, len(files)))
