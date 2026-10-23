@@ -92,16 +92,26 @@ def find_download_dir():
     return None
 
 
-def run_ego(ego, script_path, env_extra):
-    """跑一个 ego-browser nodejs 脚本"""
-    env = os.environ.copy()
-    env.update(env_extra)
+def js_str(s):
+    """把 Python 字符串转成 JS 字符串字面量（含引号）"""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def run_ego(ego, script_path, replacements):
+    """跑一个 ego-browser nodejs 脚本
+
+    ⚠️ 不用环境变量传参：实测 ego-browser 的 nodejs 子进程不继承父进程 env
+       （CNKI_QUERY 传不进去，脚本读到 undefined，落到默认值）。
+       改为读 JS 模板后替换 __PLACEHOLDER__ 占位符，再用 -e 传入。
+    """
     with open(script_path, encoding="utf-8") as f:
         script = f.read()
+    for k, v in replacements.items():
+        script = script.replace(k, v)
     r = subprocess.run(
         [ego, "nodejs", "-e", script],
         capture_output=True, text=True, encoding="utf-8", errors="ignore",
-        env=env, timeout=1800,
+        timeout=1800,
     )
     return r.returncode, (r.stdout or ""), (r.stderr or "")
 
@@ -110,10 +120,12 @@ def step1_collect(ego, journal, year, out_dir):
     """收集全部 filename"""
     print("\n【第 1 步】检索并收集文件名")
     fj = os.path.join(out_dir, "filenames.json")
+    query = "LY='%s' AND YE=%s" % (journal, year)
+    print("  检索式:", query)
     script = os.path.join(os.path.dirname(__file__), "cnki_collect_filenames.js")
     code, out, err = run_ego(ego, script, {
-        "CNKI_QUERY": "LY='%s' AND YE=%s" % (journal, year),
-        "CNKI_OUT": fj,
+        "__CNKI_QUERY__": js_str(query),
+        "__CNKI_OUT__": js_str(fj),
     })
     print(out[-2000:] if out else "(无输出)")
     if err.strip():
@@ -145,8 +157,8 @@ def step2_export(ego, data, dl_dir, out_dir, dry_run=False):
 
         before = set(glob.glob(os.path.join(dl_dir, "*.xls")))
         code, out, err = run_ego(ego, script, {
-            "CNKI_FILENAMES_FILE": ff,
-            "CNKI_DL_DIR": dl_dir,
+            "__CNKI_FILENAMES__": js_str(fn),
+            "__CNKI_DL_DIR__": js_str(dl_dir),
         })
         print(out[-1200:] if out else "(无输出)")
         if err.strip() and "Error" in err:

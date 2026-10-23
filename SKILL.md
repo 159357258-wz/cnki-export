@@ -146,6 +146,29 @@ https://kns.cnki.net/dm8/manage/export.html
 | `read_excel` 报错 | `Excel file format cannot be determined` | 用 `read_html` |
 | 专业检索 textarea 不可见 | 从「高级检索」点 tab 切换，textarea 仍 `display:none` | 直接访问 `AdvSearch?type=expert` |
 | ego-browser 拒绝运行 | `is elevated and its medium-integrity relay failed` | 用非管理员进程 |
+| **环境变量传不进脚本** | `process.env.CNKI_QUERY` 是 `undefined`，脚本静默用默认值 | **改用模板替换占位符**（`__CNKI_QUERY__`），不要用 env |
+| **检索命中数 ≠ 可导出数** | 命中 146 条，只收到 129 条 | **正常现象**：会议记录/视频等条目没有 `data-filename`，无法用导出页 URL 导出，脚本会统计「跳过 N 条」 |
+
+### 两个容易误判的点
+
+**⭐ 一、`process.env` 在 ego-browser 的 nodejs 子进程里读不到**
+
+**实测：Python `subprocess.run(env=...)` 传的环境变量，在 `ego-browser nodejs -e "..."` 的脚本里是 `undefined`。**
+
+**解法：把 JS 写成模板，用 `__PLACEHOLDER__` 占位，Python 读文件后 `.replace()` 再用 `-e` 传入。**
+
+**⭐⭐ 二、「跳过 N 条」不是丢数据**
+
+**知网检索结果里混有会议记录、视频、论坛公告等条目，它们没有 `a[data-filename]`。这些在网页上可以勾选，但导出页 URL 不收。**
+
+**实测《中国工业经济》2020 年：命中 146 条，其中 17 条是「第二届金台青年学者论坛」的会议记录/视频，实际期刊论文 129 条。**
+
+**脚本会输出：**
+
+```
+收集完成：可导出 129 条，跳过 17 条非期刊条目
+  （跳过的是会议记录/视频等，没有 data-filename，不能用导出页 URL 导出）
+```
 
 ## 输出字段（18 列）
 
