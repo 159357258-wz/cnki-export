@@ -103,15 +103,29 @@ def run_ego(ego, script_path, replacements):
     ⚠️ 不用环境变量传参：实测 ego-browser 的 nodejs 子进程不继承父进程 env
        （CNKI_QUERY 传不进去，脚本读到 undefined，落到默认值）。
        改为读 JS 模板后替换 __PLACEHOLDER__ 占位符，再用 -e 传入。
+
+    ⚠️ 脚本里的 `// __CAPTCHA_SNIPPET__` 会被替换成 _captcha.js 的内容
+       （ego-browser 的 -e 不支持 import，只能内联）。
     """
     with open(script_path, encoding="utf-8") as f:
         script = f.read()
+
+    # 内联滑块检测片段
+    captcha_path = os.path.join(os.path.dirname(script_path), "_captcha.js")
+    if "__CAPTCHA_SNIPPET__" in script:
+        if not os.path.isfile(captcha_path):
+            raise SystemExit("❗ 缺少 %s（滑块检测片段）" % captcha_path)
+        with open(captcha_path, encoding="utf-8") as f:
+            snippet = f.read()
+        script = script.replace("// __CAPTCHA_SNIPPET__", snippet)
+
     for k, v in replacements.items():
         script = script.replace(k, v)
+
     r = subprocess.run(
         [ego, "nodejs", "-e", script],
         capture_output=True, text=True, encoding="utf-8", errors="ignore",
-        timeout=1800,
+        timeout=2400,   # 留出滑块最长等待（5 分钟）+ 余量
     )
     return r.returncode, (r.stdout or ""), (r.stderr or "")
 
@@ -129,6 +143,8 @@ def step1_collect(ego, journal, year, out_dir):
     })
     print(out[-2000:] if out else "(无输出)")
     if err.strip():
+        if "滑块" in err or "captcha" in err.lower() or "验证超时" in err:
+            print("[滑块未完成] 请先手动把浏览器里的知网验证过掉，再重跑")
         print("[stderr]", err[-800:])
     if not os.path.isfile(fj):
         raise SystemExit("❗ 收集失败，没生成 %s" % fj)

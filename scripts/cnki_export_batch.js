@@ -9,6 +9,8 @@
  * 输出：ego-lite 下载目录里出现 CNKI-<时间戳>.xls
  */
 
+// __CAPTCHA_SNIPPET__
+
 const FN = __CNKI_FILENAMES__;
 const DL_DIR = __CNKI_DL_DIR__;
 const EXPORT_BASE = "https://kns.cnki.net/dm8/manage/export.html";
@@ -28,7 +30,7 @@ function snapshotDownloads() {
 const before = snapshotDownloads();
 console.log("导出前 xls 数量:", before.length);
 
-// 打开导出页
+// 打开导出页（含滑块检测）
 const t = await taskSpace("cnki-export");
 const p = t.page("p1");
 const url = EXPORT_BASE
@@ -36,12 +38,7 @@ const url = EXPORT_BASE
   + "&displaymode=selfDefine&uniplatform=NZKPT";
 console.log("URL 长度:", url.length);
 
-try {
-  await p.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-} catch (e) {
-  console.log("goto 提示:", String(e).slice(0, 100));
-}
-await new Promise(r => setTimeout(r, 6000));
+await gotoWithCaptchaCheck(p, url, "打开导出页");
 
 const info = await p.evaluate(() => {
   const txt = document.body.innerText;

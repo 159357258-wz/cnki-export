@@ -8,6 +8,8 @@
  *   [{ "f": "JGLS202012014", "db": "CJFQ", "title": "...", "page": 1 }, ...]
  */
 
+// __CAPTCHA_SNIPPET__
+
 const QUERY = __CNKI_QUERY__;
 const OUT = __CNKI_OUT__;
 const EXPERT_URL = "https://kns.cnki.net/kns8s/AdvSearch?type=expert";
@@ -19,13 +21,9 @@ const p = t.page("p1");
 console.log("检索式:", QUERY);
 console.log("输出:", OUT);
 
-// 1. 打开专业检索页
-try {
-  await p.goto(EXPERT_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
-} catch (e) {
-  console.log("goto 提示:", String(e).slice(0, 100));
-}
-await new Promise(r => setTimeout(r, 5000));
+// 1. 打开专业检索页（含滑块检测）
+await gotoWithCaptchaCheck(p, EXPERT_URL, "打开专业检索页");
+await new Promise(r => setTimeout(r, 1500));
 
 // 2. 检查登录态
 const loginOk = await p.evaluate(() => {
@@ -51,12 +49,14 @@ if (setOk !== QUERY) {
   throw new Error("fill failed");
 }
 
-// 4. 检索
+// 4. 检索（检索后可能弹滑块）
 await p.evaluate(() => {
   const b = document.querySelector("input.btn-search");
   if (b) b.click();
 });
-await new Promise(r => setTimeout(r, 12000));
+await new Promise(r => setTimeout(r, 8000));
+await waitIfCaptcha(p, "点检索之后");
+await new Promise(r => setTimeout(r, 4000));
 
 // 5. 读总数
 const head = await p.evaluate(() => {
@@ -134,10 +134,11 @@ while (pageNo <= MAX_PAGES) {
     break;
   }
 
-  // 轮询等页面刷新（最多 15 秒）
+  // 轮询等页面刷新（最多 20 秒）；期间若弹滑块则等待人工
   let changed = false;
-  for (let w = 0; w < 30; w++) {
+  for (let w = 0; w < 40; w++) {
     await new Promise(r => setTimeout(r, 500));
+    await waitIfCaptcha(p, "翻到第 " + (pageNo + 1) + " 页时");
     const tNow = await firstTitle();
     if (tNow && tNow !== tBefore) { changed = true; break; }
   }
