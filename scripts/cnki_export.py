@@ -39,7 +39,9 @@ import time
 
 import pandas as pd
 
-BATCH_LIMIT = 500  # 知网勾选上限（实测）
+BATCH_LIMIT = 200  # 每批条数上限（实测：500 条 → 414 Request-URI Too Large；
+                   #                    300 条 → HTTP 400 Bad Request；
+                   #                    200 条 → OK，URL 约 4291 字符）
 
 
 def find_ego_browser():
@@ -97,52 +99,78 @@ def js_str(s):
     return json.dumps(s, ensure_ascii=False)
 
 
-def run_ego(ego, script_path, replacements):
-    """跑一个 ego-browser nodejs 脚本
+def run_ego(ego, script_path, replacements, timeout=1800, label=""):
+    """跑一个 ego-browser nodejs 脚本（实时流式输出）
 
-    ⚠️ 不用环境变量传参：实测 ego-browser 的 nodejs 子进程不继承父进程 env
-       （CNKI_QUERY 传不进去，脚本读到 undefined，落到默认值）。
-       改为读 JS 模板后替换 __PLACEHOLDER__ 占位符，再用 -e 传入。
+    ⚠️ 为什么不用 subprocess.run(capture_output=True)：
+       它会阻塞到进程结束，中途看不到任何输出。如果 ego-browser 卡住
+       （比如浏览器没启动、页面导航死等），只能干等到 timeout（原来 2400 秒）。
+       改成 Popen + 逐行读 stdout，每行实时打印。
 
-    ⚠️ 脚本里的 `// __CAPTCHA_SNIPPET__` 会被替换成 _captcha.js 的内容
-       （ego-browser 的 -e 不支持 import，只能内联）。
+    ⚠️ 不用环境变量传参：ego-browser 的 nodejs 子进程不继承父进程 env
+       （CNKI_QUERY 传不进去，脚本读到 undefined，静默落到默认值。
+       实测踩过：把 560 条的 query 写成了别人的任务）。
+
+    ⚠️ 脚本本身用 fs.appendFileSync 写日志文件（见 JS 里的 LOG 常量）：
+       console.log 的输出经 cmd /c 重定向后会被完全缓冲，拿不到实时进度。
     """
     with open(script_path, encoding="utf-8") as f:
         script = f.read()
 
-    # 内联滑块检测片段
-    captcha_path = os.path.join(os.path.dirname(script_path), "_captcha.js")
-    if "__CAPTCHA_SNIPPET__" in script:
-        if not os.path.isfile(captcha_path):
-            raise SystemExit("❗ 缺少 %s（滑块检测片段）" % captcha_path)
-        with open(captcha_path, encoding="utf-8") as f:
-            snippet = f.read()
-        script = script.replace("// __CAPTCHA_SNIPPET__", snippet)
-
     for k, v in replacements.items():
         script = script.replace(k, v)
 
-    r = subprocess.run(
+    if label:
+        print("  [启动] %s（脚本 %d 字符，超时 %d 秒）" % (label, len(script), timeout))
+
+    t0 = time.time()
+    proc = subprocess.Popen(
         [ego, "nodejs", "-e", script],
-        capture_output=True, text=True, encoding="utf-8", errors="ignore",
-        timeout=2400,   # 留出滑块最长等待（5 分钟）+ 余量
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="ignore",
+        bufsize=1,
     )
-    return r.returncode, (r.stdout or ""), (r.stderr or "")
+
+    lines = []
+    last_print = time.time()
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\r\n")
+            if line:
+                elapsed = time.time() - t0
+                print("    [%5.1fs] %s" % (elapsed, line))
+                lines.append(line)
+                last_print = time.time()
+            if time.time() - t0 > timeout:
+                proc.kill()
+                print("    ❌ 超时 %d 秒，已终止" % timeout)
+                break
+    finally:
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    elapsed = time.time() - t0
+    if label:
+        print("  [完成] %s 用时 %.1f 秒，退出码 %s" % (label, elapsed, proc.returncode))
+
+    return proc.returncode or 0, "\n".join(lines), ""
 
 
 def step_check(ego, journal, year, out_dir):
-    """只检查环境：打开页面 + 登录态 + 滑块 + 检索 1 次（约 8 秒）"""
+    """只检查环境：打开页面 + 登录态 + 滑块 + 检索 1 次（约 8—25 秒）"""
     print("\n【检查模式】不翻页、不导出")
     query = "LY='%s' AND YE=%s" % (journal, year)
     script = os.path.join(os.path.dirname(__file__), "cnki_check.js")
     if not os.path.isfile(script):
         raise SystemExit("❗ 缺少 %s" % script)
-    code, out, err = run_ego(ego, script, {"__CNKI_QUERY__": js_str(query)})
-    print(out if out else "(无输出)")
-    if err.strip():
-        print("[stderr]", err[-800:])
+    code, out, err = run_ego(ego, script, {"__CNKI_QUERY__": js_str(query)},
+                             timeout=180, label="自检")
     if code != 0:
         raise SystemExit("❗ 自检失败（退出码 %d）" % code)
+    print("\n✅ 自检通过")
     return True
 
 
@@ -162,12 +190,10 @@ def step1_collect(ego, journal, year, out_dir, max_pages=0):
         "__CNKI_QUERY__": js_str(query),
         "__CNKI_OUT__": js_str(fj),
         "const MAX_PAGES = 80;": "const MAX_PAGES = %d;" % (max_pages if max_pages else 80),
-    })
-    print(out[-2000:] if out else "(无输出)")
-    if err.strip():
-        if "滑块" in err or "captcha" in err.lower() or "验证超时" in err:
-            print("[滑块未完成] 请先手动把浏览器里的知网验证过掉，再重跑")
-        print("[stderr]", err[-800:])
+    }, timeout=900, label="收集文件名")
+    if code != 0:
+        if "滑块" in out or "验证" in out:
+            print("\n[提示] 如果浏览器里出现知网滑块验证，请手动拖一下，然后重跑")
     if not os.path.isfile(fj):
         raise SystemExit("❗ 收集失败，没生成 %s" % fj)
     data = json.load(open(fj, encoding="utf-8"))
@@ -197,10 +223,7 @@ def step2_export(ego, data, dl_dir, out_dir, dry_run=False):
         code, out, err = run_ego(ego, script, {
             "__CNKI_FILENAMES__": js_str(fn),
             "__CNKI_DL_DIR__": js_str(dl_dir),
-        })
-        print(out[-1200:] if out else "(无输出)")
-        if err.strip() and "Error" in err:
-            print("[stderr]", err[-500:])
+        }, timeout=300, label="导出第 %d/%d 批" % (bi, len(batches)))
 
         # 找新文件
         deadline = time.time() + 30

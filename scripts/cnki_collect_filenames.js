@@ -1,14 +1,11 @@
 /**
- * 收集知网检索结果的全部 data-filename
+ * 收集知网检索结果的全部 data-filename（原生版，无滑块检测）
  *
- * ⚠️ 本脚本不读环境变量（实测 ego-browser 的 nodejs 子进程不继承父进程 env）。
- *    由 Python 侧把 __CNKI_QUERY__ / __CNKI_OUT__ 占位符替换后，用 -e 传入。
+ * 由 Python 侧替换占位符 __CNKI_QUERY__ / __CNKI_OUT__ 后传入。
  *
  * 输出 JSON：
- *   [{ "f": "JGLS202012014", "db": "CJFQ", "title": "...", "page": 1 }, ...]
+ *   [{ "f": "GGYY202012006", "db": "CJFQ", "title": "...", "page": 1 }, ...]
  */
-
-// __CAPTCHA_SNIPPET__
 
 const QUERY = __CNKI_QUERY__;
 const OUT = __CNKI_OUT__;
@@ -21,9 +18,13 @@ const p = t.page("p1");
 console.log("检索式:", QUERY);
 console.log("输出:", OUT);
 
-// 1. 打开专业检索页（含滑块检测）
-await gotoWithCaptchaCheck(p, EXPERT_URL, "打开专业检索页");
-await new Promise(r => setTimeout(r, 1500));
+// 1. 打开专业检索页
+try {
+  await p.goto(EXPERT_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
+} catch (e) {
+  console.log("goto 提示:", String(e).slice(0, 100));
+}
+await new Promise(r => setTimeout(r, 5000));
 
 // 2. 检查登录态
 const loginOk = await p.evaluate(() => {
@@ -49,14 +50,12 @@ if (setOk !== QUERY) {
   throw new Error("fill failed");
 }
 
-// 4. 检索（检索后可能弹滑块）
+// 4. 检索
 await p.evaluate(() => {
   const b = document.querySelector("input.btn-search");
   if (b) b.click();
 });
-await new Promise(r => setTimeout(r, 8000));
-await waitIfCaptcha(p, "点检索之后");
-await new Promise(r => setTimeout(r, 4000));
+await new Promise(r => setTimeout(r, 12000));
 
 // 5. 读总数
 const head = await p.evaluate(() => {
@@ -75,14 +74,15 @@ if (!head.total || head.total === "0") {
 
 // 6. 逐页收集
 const all = [];
-let skipped = 0;   // 无 data-filename 的行（会议记录/视频等非期刊条目）
+let skipped = 0;
 let pageNo = 1;
 
-// 读当前页第一行题名（用于判断翻页是否完成）
-async function firstTitle() {
+// 读页码指示器（如 "3/28" 的 "3"）—— 比「第一行题名」可靠
+async function curPage() {
   return await p.evaluate(() => {
-    const a = document.querySelector("table.result-table-list tbody tr td.name a");
-    return a ? (a.textContent || "").trim() : "";
+    const txt = document.body.innerText;
+    const m = txt.match(/(\d+)\/(\d+)/);
+    return m ? m[1] : "";
   });
 }
 
@@ -111,8 +111,10 @@ while (pageNo <= MAX_PAGES) {
   skipped += page.noFn;
 
   if (pageNo % 5 === 0 || pageNo === 1 || page.noFn > 0) {
+    // 打印本页文件名前缀（前 6 位），用于交叉核对期刊
+    const prefix = page.rows.length > 0 ? page.rows.map(r => r.f.slice(0, 4)).filter((v, i, a) => a.indexOf(v) === i).join("/") : "-";
     console.log("  第 " + pageNo + " 页：可导出 " + page.rows.length
-      + " 条，跳过 " + page.noFn + " 条（无 data-filename），累计 " + all.length);
+      + " 条，跳过 " + page.noFn + " 条，累计 " + all.length + " ｜前缀 " + prefix);
   }
 
   if (page.totalTr === 0) {
@@ -120,8 +122,8 @@ while (pageNo <= MAX_PAGES) {
     break;
   }
 
-  // 翻页：先记第一行，点下一页，再轮询等第一行变化
-  const tBefore = await firstTitle();
+  // 翻页：等「页码指示器」变化（比等第一行题名可靠）
+  const pBefore = await curPage();
   const moved = await p.evaluate(() => {
     const n = document.querySelector("#PageNext");
     if (!n) return false;
@@ -134,25 +136,21 @@ while (pageNo <= MAX_PAGES) {
     break;
   }
 
-  // 轮询等页面刷新（最多 20 秒）；期间若弹滑块则等待人工
   let changed = false;
-  for (let w = 0; w < 40; w++) {
-    await new Promise(r => setTimeout(r, 500));
-    await waitIfCaptcha(p, "翻到第 " + (pageNo + 1) + " 页时");
-    const tNow = await firstTitle();
-    if (tNow && tNow !== tBefore) { changed = true; break; }
+  for (let w = 0; w < 60; w++) {
+    await new Promise(r => setTimeout(r, 300));
+    const pNow = await curPage();
+    if (pNow && pNow !== pBefore) { changed = true; break; }
   }
   if (!changed) {
-    console.log("  ⚠️ 第 " + (pageNo + 1) + " 页刷新超时，仍继续");
+    console.log("  ⚠️ 第 " + (pageNo + 1) + " 页页码未变化（" + pBefore + "），停止以免收错数据");
+    break;
   }
 
   pageNo++;
 }
 
 console.log("收集完成：可导出 " + all.length + " 条，跳过 " + skipped + " 条非期刊条目");
-console.log("  （跳过的是会议记录/视频等，没有 data-filename，不能用导出页 URL 导出）");
-
-console.log("收集完成，共 " + all.length + " 条");
 if (all.length > 0) {
   console.log("  首条:", all[0].f, all[0].db, all[0].title.slice(0, 30));
 }

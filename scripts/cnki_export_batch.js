@@ -1,15 +1,10 @@
 /**
- * 导出知网文献为 xls（走导出页 URL，不点 hover 菜单）
+ * 导出知网文献为 xls（原生版，无滑块检测）
  *
- * ⚠️ 本脚本不读环境变量（ego-browser 的 nodejs 子进程不继承父进程 env）。
- *    由 Python 侧替换占位符后传入：
- *      __CNKI_FILENAMES__  已带库代码前缀的 filename 串（CJFQ!xxx,CJFQ!yyy,...）
- *      __CNKI_DL_DIR__     下载目录（用于核对新文件）
- *
- * 输出：ego-lite 下载目录里出现 CNKI-<时间戳>.xls
+ * 由 Python 侧替换占位符：
+ *   __CNKI_FILENAMES__  已带库代码前缀的 filename 串（CJFQ!xxx,CJFQ!yyy,...）
+ *   __CNKI_DL_DIR__     下载目录（用于核对新文件）
  */
-
-// __CAPTCHA_SNIPPET__
 
 const FN = __CNKI_FILENAMES__;
 const DL_DIR = __CNKI_DL_DIR__;
@@ -30,7 +25,7 @@ function snapshotDownloads() {
 const before = snapshotDownloads();
 console.log("导出前 xls 数量:", before.length);
 
-// 打开导出页（含滑块检测）
+// 打开导出页
 const t = await taskSpace("cnki-export");
 const p = t.page("p1");
 const url = EXPORT_BASE
@@ -38,7 +33,12 @@ const url = EXPORT_BASE
   + "&displaymode=selfDefine&uniplatform=NZKPT";
 console.log("URL 长度:", url.length);
 
-await gotoWithCaptchaCheck(p, url, "打开导出页");
+try {
+  await p.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+} catch (e) {
+  console.log("goto 提示:", String(e).slice(0, 100));
+}
+await new Promise(r => setTimeout(r, 6000));
 
 const info = await p.evaluate(() => {
   const txt = document.body.innerText;
@@ -114,7 +114,6 @@ if (added.length > 0) {
       console.log("   " + f);
     }
   });
-  console.log("NEWFILE:" + added[0]);
 } else {
   console.log("⚠️ 没找到新文件");
 }
