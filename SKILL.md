@@ -118,23 +118,14 @@ const K = await import("file:///F:/工具/_外部技能库/cnki-export/scripts/e
 
 **⭐ 关键：`#PageNext` 是真正的下一页按钮。不要点 `a.adbutnext-btn`（那是广告）。**
 
-### 第 3 步：分批构造导出页 URL
+### 第 3 步：分批提交导出页（用 POST，不要用 GET）
 
-**知网勾选上限 500 条。超过弹窗：**
-
-```
-不能超过500个,若要重新选择,请按清除按钮,再进行选取操作
-```
-
-**所以按 500 一批切分。**
-
-**URL 格式：**
+**参数格式：**
 
 ```
-https://kns.cnki.net/dm8/manage/export.html
-  ?filename=<库代码!文件名,库代码!文件名,...>
-  &displaymode=selfDefine
-  &uniplatform=NZKPT
+filename      = <库代码!文件名,库代码!文件名,...>
+displaymode   = selfDefine        （自定义，含摘要）
+uniplatform   = NZKPT
 ```
 
 **⭐ 三个必须注意的点：**
@@ -142,10 +133,63 @@ https://kns.cnki.net/dm8/manage/export.html
 ```
 ① 必须带「库代码!」前缀（CJFQ!JGLS202012014），否则返回「暂无数据」
 ② 多个文件名用英文逗号分隔
-③ 整个 filename 参数要 URL 编码
+③ 用 <form method="POST"> 提交，不要拼进 URL
 ```
 
-**⭐⭐ 第 1 批 500 个文件名约 9500 字符，URL 约 11000 字符 —— 实测浏览器能接受，但已接近上限。超过就再切小。**
+**⭐⭐ 为什么必须 POST：GET 有 URL 长度天花板。**
+
+```
+GET  250 条 → URL 5341 字符  ✅ 200
+GET  300 条 → URL 6391 字符  ❌ 400 Bad Request
+GET  500 条 → URL 10591 字符 ❌ 414 Request-URI Too Large
+POST 500 条 → ✅（导航 1.1 秒）
+POST 560 条 → ✅（但字段区不渲染、点不到 xls）
+```
+
+**⭐⭐⭐ 但真正的批量上限不是 URL，是验证码：**
+
+```
+100 条/批 → 0 次验证码（连续 6 批，两轮验证）
+200 条/批 → 触发点阵验证码「请依次点击【的、点】」（多次复现）
+250 条/批 → 触发，且 xls 生成 20 秒/批（100 条只要 2.7 秒）
+```
+
+**所以：`BATCH_LIMIT = 100`，批间留 5 秒（`BATCH_GAP_SEC`）避开「按次限速」。**
+
+**⭐⭐ POST 提交必须从同源页面发起：**
+
+```javascript
+// 新 taskSpace 的 p1 是 about:blank，在它上面建 form 并 submit，
+// 浏览器不执行导航（实测停在空白页，随后等 #litoexcel 40 秒超时）。
+if (cur === "about:blank" || cur.indexOf("kns.cnki.net") < 0) {
+  await page.goto("https://kns.cnki.net/kns8s/AdvSearch?type=expert",
+                  { waitUntil: "domcontentloaded", timeout: 30000 });
+}
+// 然后建 form 提交
+await page.evaluate((filename) => {
+  const f = document.createElement("form");
+  f.method = "POST";
+  f.action = "https://kns.cnki.net/dm8/manage/export.html";
+  f.style.display = "none";
+  const add = (name, value) => {
+    const i = document.createElement("input");
+    i.type = "hidden"; i.name = name; i.value = value;
+    f.appendChild(i);
+  };
+  add("filename", filename);
+  add("displaymode", "selfDefine");
+  add("uniplatform", "NZKPT");
+  document.body.appendChild(f);
+  f.submit();
+}, fn);
+```
+
+**⭐⭐⭐ 导出页加载**必须等字段区**，不能只等 xls 按钮：**
+
+**只等 `#litoexcel` 时页面正文可能只有 618 字，字段区还没出来，
+`checkAllFields()` 找不到 `div.check-labels`，等于没勾 → 导出只有 5 列、没有摘要。**
+
+**正确条件：`div.check-labels input` ≥ 10 且正文 > 1000 字。**
 
 ### 第 4 步：在导出页点「xls」
 
@@ -182,7 +226,7 @@ https://kns.cnki.net/dm8/manage/export.html
 |---|---|---|
 | 导出菜单点不到 | `selfDefine` 元素 rect 恒为 `[0,0,0,0]` | 不点菜单，构造 URL |
 | 导出页「暂无数据」 | URL 的 filename 少了 `CJFQ!` 前缀 | 加库代码前缀 |
-| 勾选超过 500 条 | 弹「不能超过500个」 | 按 500 分批 |
+| 勾选超过 500 条 | 弹「不能超过500个」 | 改用 POST 提交（GET 的 URL 上限更早触发） |
 | 翻页点错按钮 | 点了 `a.adbutnext-btn`（广告），页面不翻 | 用 `#PageNext` |
 | 找不到下载文件 | `Downloads` 里没有 | 读 Preferences 的 `default_directory` |
 | `read_excel` 报错 | `Excel file format cannot be determined` | 用 `read_html` |
