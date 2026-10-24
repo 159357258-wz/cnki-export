@@ -1,89 +1,122 @@
 /**
- * 知网环境自检（不翻页、不导出，约 8—20 秒）
+ * cnki_check.js —— 知网环境自检（不翻页、不导出，约 8—20 秒）
  *
- * 检查四件事：
- *   ① 专业检索页能否打开
- *   ② 机构登录态是否生效（页面顶部是否显示单位名）
- *   ③ 检索式能否命中（命中多少条）
- *   ④ 第 1 页能否读到 data-filename
+ * 检查六件事：
+ *   ① 专业检索页能否打开（page.goto + page.waitForSelector）
+ *   ② 是否弹滑块（page.evaluate 三判据，不看 DOM 类名）
+ *   ③ 机构登录态是否生效（页面顶部单位名）
+ *   ④ 检索式能否命中（page.click + page.waitForFunction）
+ *   ⑤ 第 1 页能否读到 data-filename（page.evaluate）
+ *   ⑥ 失败时截图 + 诊断（page.screenshot + page.info）
  *
- * 占位符由 Python 侧替换：__CNKI_QUERY__
+ * 占位符（由 cnki_export.py 替换）：
+ *   __CNKI_QUERY__   自检用的检索式
+ *   __CNKI_LOG__     日志绝对路径
+ *   __CNKI_SPACE__   ego 任务空间名
+ *
+ * 用到的 ego API（9 个）：
+ *   taskSpace, task.spaceId, task.page, task.finish
+ *   page.goto, page.waitForSelector, page.waitForFunction, page.click,
+ *   page.fill, page.evaluate, page.info, page.screenshot
  */
 
+const K = await import("file:///F:/工具/_外部技能库/cnki-export/scripts/ego_kit.js");
 const fs = await import("node:fs");
-const LOG = "C:\\ego_test\\check.log";
-function log(m) {
-  try { fs.appendFileSync(LOG, m + "\n", "utf8"); } catch (e) {}
-  console.log(m);
-}
-try { fs.writeFileSync(LOG, "", "utf8"); } catch (e) {}
 
 const QUERY = __CNKI_QUERY__;
-const EXPERT_URL = "https://kns.cnki.net/kns8s/AdvSearch?type=expert";
+const LOG = __CNKI_LOG__;
+const SPACE = __CNKI_SPACE__;
 
-log("检索式: " + QUERY);
+const L = K.makeLogger(LOG);
 
-const t = await taskSpace("cnki-check");
-const p = t.page("p1");
+L.log("════ 自检开始 ════");
+L.log("检索式 " + QUERY);
+
+const checks = [];
+function add(name, ok, detail) {
+  checks.push({ name, ok, detail });
+  L.log((ok ? "✅ " : "❌ ") + name + "｜" + detail);
+}
+
+let task = null;
+let page = null;
 
 try {
-  await p.goto(EXPERT_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
+  const opened = await K.openSpace(SPACE, "p1", L);
+  task = opened.task;
+  page = opened.page;
+  add("任务空间", true, "id=" + task.spaceId + " page=" + page.label);
+
+  // ① 打开检索页
+  let info = null;
+  try {
+    info = await K.gotoExpert(page, { logger: L });
+    add("检索页打开", true, "title=" + info.title);
+  } catch (e) {
+    add("检索页打开", false, String(e).slice(0, 120));
+    throw e;
+  }
+
+  // ② 滑块
+  const cap = await K.checkCaptcha(page);
+  add("无滑块", !cap.blocked,
+    "urlIsVerify=" + cap.urlIsVerify + " titleIsCaptcha=" + cap.titleIsCaptcha +
+    " bodyIsCaptcha=" + cap.bodyIsCaptcha);
+  if (cap.blocked) throw new Error("滑块拦截，请在 ego 里手动完成");
+
+  // ③ 机构登录态（用 kit 的 readInstitution，内部等过顶栏渲染）
+  const inst = await K.readInstitution(page);
+  add("机构登录", !!inst, inst || "未识别到单位名（若检索能命中，通常说明登录态在）");
+
+  // ④ 检索
+  await K.fillQuery(page, QUERY, { logger: L });
+  const ms = await K.submitSearch(page, { logger: L });
+  const hit = await K.readHitInfo(page);
+  add("检索命中", !!hit.total && hit.total !== "0",
+    hit.total + " 条 / " + hit.pageCount + " 页（耗时 " + (ms / 1000).toFixed(1) + "s）");
+  if (!hit.total || hit.total === "0") throw new Error("检索无结果");
+
+  // ⑤ 读第一页
+  const pg = await K.readRows(page);
+  const withFn = pg.rows.filter((r) => r.f).length;
+  add("读到 data-filename", withFn > 0,
+    withFn + " 条有 filename，" + pg.noFn + " 条无（会议/视频类正常无）");
+
+  // ⑥ 诊断信息
+  const d = await K.diagnose(page, {});
+  L.log("诊断 url=" + d.url + " rows=" + d.dom.rows + " bodyLen=" + d.dom.bodyLen);
+
 } catch (e) {
-  log("goto 提示: " + String(e).slice(0, 100));
+  L.log("❌ 异常 " + String(e).slice(0, 200));
+  if (page) {
+    try {
+      const shot = LOG.replace(/\.log$/i, "") + "_自检失败.png";
+      await K.shoot(page, shot, { fullPage: true, logger: L });
+    } catch (e2) { /* 忽略 */ }
+  }
+} finally {
+  const okCount = checks.filter((c) => c.ok).length;
+  L.log("────────────────────────────");
+  L.log("自检结果: " + okCount + "/" + checks.length + " 项通过");
+  const allOk = checks.length >= 5 && okCount === checks.length;
+  L.log(allOk ? "✅ 环境可用" : "⚠️ 有问题，见上");
+
+  // 结果 JSON（Python 侧读它判断）
+  try {
+    const rp = LOG.replace(/\.log$/i, "") + "_结果.json";
+    fs.writeFileSync(rp, JSON.stringify({
+      ok: allOk,
+      passed: okCount,
+      total: checks.length,
+      checks,
+    }, null, 2), "utf8");
+    L.log("结果写入 " + rp);
+  } catch (e) { /* 忽略 */ }
+
+  if (task) {
+    const fin = await K.finish(task, []);
+    L.log("finish " + JSON.stringify(fin).slice(0, 120));
+  }
+
+  L.log("总耗时 " + L.elapsed() + "s");
 }
-await new Promise(r => setTimeout(r, 4000));
-
-const taOk = await p.evaluate(() => {
-  const ta = document.querySelector("textarea.textarea-major");
-  return { has: !!ta, visible: ta ? ta.offsetParent !== null : false };
-});
-log("① textarea 存在=" + taOk.has + " 可见=" + taOk.visible);
-
-const login = await p.evaluate(() => {
-  const txt = document.body.innerText.slice(0, 400);
-  const m = txt.match(/([\u4e00-\u9fa5]{2,20})\s+个人登录/);
-  return { unit: m ? m[1] : "", hasBtn: /机构登录|个人登录/.test(txt) };
-});
-if (login.unit) {
-  log("② 已登录机构: " + login.unit);
-} else {
-  log("② 未检测到机构名（可能未登录）");
-}
-
-const setOk = await p.evaluate((q) => {
-  const ta = document.querySelector("textarea.textarea-major");
-  if (!ta) return "NO_TA";
-  ta.focus();
-  ta.value = q;
-  ta.dispatchEvent(new Event("input", { bubbles: true }));
-  return ta.value;
-}, QUERY);
-log("③ 已填入: " + setOk);
-
-await p.evaluate(() => {
-  const b = document.querySelector("input.btn-search");
-  if (b) b.click();
-});
-await new Promise(r => setTimeout(r, 12000));
-
-const res = await p.evaluate(() => {
-  const txt = document.body.innerText;
-  const m = txt.match(/共找到\s*([\d,]+)\s*条/);
-  const pg = txt.match(/(\d+)\/(\d+)/);
-  const rows = document.querySelectorAll("table.result-table-list tbody tr").length;
-  const withFn = document.querySelectorAll("a[data-filename]").length;
-  return {
-    total: m ? m[1] : "",
-    page: pg ? pg.slice(1).join("/") : "",
-    rows: rows,
-    withFn: withFn
-  };
-});
-log("④ 命中 " + res.total + " 条 | 页码 " + res.page
-  + " | 第1页 " + res.rows + " 行，其中 " + res.withFn + " 条有 data-filename");
-
-if (!res.total || res.total === "0") {
-  log("❌ 检索结果为 0 —— 检查刊名是否与知网「文献来源」完全一致");
-  throw new Error("no result");
-}
-log("✅ 自检通过");

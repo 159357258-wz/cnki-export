@@ -1,164 +1,132 @@
 /**
- * 收集知网检索结果的全部 data-filename（原生版，无滑块检测）
+ * cnki_collect_filenames.js —— 收集知网某刊某年的全部 data-filename
  *
- * 由 Python 侧替换占位符 __CNKI_QUERY__ / __CNKI_OUT__ 后传入。
+ * 占位符（由 cnki_export.py 的 js_str 替换为 JS 字面量）：
+ *   __CNKI_QUERY__      检索式，如 "LY='价格理论与实践' AND YE=2020"
+ *   __CNKI_OUT__        输出 JSON 绝对路径
+ *   __CNKI_LOG__        日志绝对路径
+ *   __CNKI_MAX_PAGES__  最多翻多少页（数字，不带引号）
+ *   __CNKI_SPACE__      ego 任务空间名
  *
- * 输出 JSON：
- *   [{ "f": "GGYY202012006", "db": "CJFQ", "title": "...", "page": 1 }, ...]
+ * 相比旧版的改进：
+ *   ① 翻页不再 for 循环 × 40 次 × 300ms 轮询，改用 page.waitForFunction(polling:100)
+ *   ② 检索不再固定 sleep 12 秒，改用 page.waitForFunction 等结果行出现
+ *   ③ 填检索式用 page.fill(clearFirst) + evaluate 回读校验
+ *   ④ 失败时 page.screenshot 取证 + page.info/page.url 诊断
+ *   ⑤ 收尾用 task.finish 明确保留 p1
+ *
+ * 用到的 ego API（14 个）：
+ *   taskSpace, task.spaceId, task.page, task.pages, task.tabs, task.finish
+ *   page.goto, page.waitForSelector, page.waitForFunction, page.click,
+ *   page.fill, page.evaluate, page.info, page.screenshot
  */
+
+const K = await import("file:///F:/工具/_外部技能库/cnki-export/scripts/ego_kit.js");
+const fs = await import("node:fs");
 
 const QUERY = __CNKI_QUERY__;
 const OUT = __CNKI_OUT__;
-const EXPERT_URL = "https://kns.cnki.net/kns8s/AdvSearch?type=expert";
-const MAX_PAGES = 80;
+const LOG = __CNKI_LOG__;
+const MAX_PAGES = __CNKI_MAX_PAGES__;
+const SPACE = __CNKI_SPACE__;
 
-const t = await taskSpace("cnki-collect");
-const p = t.page("p1");
+const L = K.makeLogger(LOG);
 
-console.log("检索式:", QUERY);
-console.log("输出:", OUT);
+L.log("════ 收集开始 ════");
+L.log("检索式: " + QUERY);
+L.log("最多页数: " + MAX_PAGES);
+L.log("ego_kit 已加载（22 个函数）");
 
-// 1. 打开专业检索页
-try {
-  await p.goto(EXPERT_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
-} catch (e) {
-  console.log("goto 提示:", String(e).slice(0, 100));
-}
-await new Promise(r => setTimeout(r, 5000));
-
-// 2. 检查登录态
-const loginOk = await p.evaluate(() => {
-  const txt = document.body.innerText;
-  return { head: txt.slice(0, 220).replace(/\s+/g, " ") };
-});
-console.log("页面头部:", loginOk.head.slice(0, 140));
-
-// 3. 输入检索式
-const setOk = await p.evaluate((q) => {
-  const ta = document.querySelector("textarea.textarea-major");
-  if (!ta) return "找不到 textarea.textarea-major";
-  ta.focus();
-  ta.value = q;
-  ta.dispatchEvent(new Event("input", { bubbles: true }));
-  ta.dispatchEvent(new Event("change", { bubbles: true }));
-  return ta.value;
-}, QUERY);
-console.log("已填入:", setOk);
-
-if (setOk !== QUERY) {
-  console.log("❗ 检索式没填进去");
-  throw new Error("fill failed");
-}
-
-// 4. 检索
-await p.evaluate(() => {
-  const b = document.querySelector("input.btn-search");
-  if (b) b.click();
-});
-await new Promise(r => setTimeout(r, 12000));
-
-// 5. 读总数
-const head = await p.evaluate(() => {
-  const txt = document.body.innerText;
-  return {
-    total: (txt.match(/共找到\s*([\d,]+)\s*条/) || [])[1],
-    page: (txt.match(/(\d+)\/(\d+)/) || []).slice(1).join("/")
-  };
-});
-console.log("检索结果:", JSON.stringify(head));
-
-if (!head.total || head.total === "0") {
-  console.log("❗ 没有检索到结果 —— 检查刊名是否与知网「文献来源」完全一致");
-  throw new Error("no result");
-}
-
-// 6. 逐页收集
+let task = null;
+let page = null;
 const all = [];
 let skipped = 0;
-let pageNo = 1;
+let failed = "";
 
-// 读页码指示器（如 "3/28" 的 "3"）—— 比「第一行题名」可靠
-async function curPage() {
-  return await p.evaluate(() => {
-    const txt = document.body.innerText;
-    const m = txt.match(/(\d+)\/(\d+)/);
-    return m ? m[1] : "";
-  });
+try {
+  // 1. 开空间
+  const opened = await K.openSpace(SPACE, "p1", L);
+  task = opened.task;
+  page = opened.page;
+
+  // 2. 列空间（task.pages / task.tabs）
+  const space = await K.listSpace(task);
+  L.log("空间: pages=" + JSON.stringify(space.pages) + " tabs=" + space.tabs);
+
+  // 3. 打开检索页（goto + waitForSelector + info）
+  await K.gotoExpert(page, { logger: L });
+
+  // 4. 滑块检查（evaluate 三判据）
+  await K.assertNoCaptcha(page, "检索页");
+
+  // 5. 填检索式（fill + evaluate 回读）
+  await K.fillQuery(page, QUERY, { logger: L });
+
+  // 6. 检索并等结果（click + waitForFunction）
+  await K.submitSearch(page, { logger: L });
+
+  // 7. 命中信息
+  const hit = await K.readHitInfo(page);
+  L.log("命中 " + hit.total + " 条 / " + hit.pageCount + " 页");
+  if (!hit.total || hit.total === "0") throw new Error("检索无结果");
+
+  // 8. 逐页收集
+  let no = 1;
+  while (no <= MAX_PAGES) {
+    const pg = await K.readRows(page);
+    pg.rows.forEach((r) => { r.page = no; });
+    all.push(...pg.rows);
+    skipped += pg.noFn;
+
+    const prefix = pg.rows.length
+      ? [...new Set(pg.rows.map((r) => String(r.f).slice(0, 4)))].join("/")
+      : "-";
+    L.log("第" + no + "页 rows=" + pg.rows.length + " noFn=" + pg.noFn +
+      " cum=" + all.length + " prefix=" + prefix + " @" + L.elapsed() + "s");
+
+    if (pg.rows.length === 0 && pg.noFn === 0) { L.log("空页，结束"); break; }
+    // 先判自设上限，再判末页，避免多翻一次无用页（实测多翻一次白费 1.2 秒）
+    if (no >= MAX_PAGES) { L.log("已到自设上限 " + MAX_PAGES + " 页，结束"); break; }
+    if (no >= hit.pageCount) { L.log("已到末页（" + hit.pageCount + "），结束"); break; }
+
+    const next = await K.gotoNextPage(page, { logger: L });
+    if (!next.moved) { L.log("无法继续翻页，结束"); break; }
+    no = next.pageNo;
+  }
+
+  L.log("收集完成 " + all.length + " 条（跳过 " + skipped + " 条无 filename）");
+
+} catch (e) {
+  failed = String(e).slice(0, 300);
+  L.log("❌ " + failed);
+
+  if (page) {
+    try {
+      const shot = OUT.replace(/\.json$/i, "") + "_失败截图.png";
+      await K.shoot(page, shot, { fullPage: true, logger: L });
+      const d = await K.diagnose(page, { withSnapshot: true });
+      L.log("诊断 url=" + d.url + " title=" + d.info.title +
+        " rows=" + d.dom.rows + " queryBox=" + d.dom.hasQueryBox);
+    } catch (e2) {
+      L.log("取证失败 " + String(e2).slice(0, 100));
+    }
+  }
+} finally {
+  // 9. 写结果
+  try {
+    fs.mkdirSync(OUT.substring(0, OUT.lastIndexOf("\\")), { recursive: true });
+    fs.writeFileSync(OUT, JSON.stringify(all, null, 1), "utf8");
+    L.log("写入 " + OUT + "（" + all.length + " 条，" +
+      Math.round(fs.statSync(OUT).size / 1024) + " KB）");
+  } catch (e) {
+    L.log("写入失败 " + String(e).slice(0, 200));
+  }
+
+  // 10. 收尾
+  if (task) {
+    const fin = await K.finish(task, []);
+    L.log("finish " + JSON.stringify(fin).slice(0, 150));
+  }
+
+  L.log("总耗时 " + L.elapsed() + "s" + (failed ? "（失败）" : ""));
 }
-
-while (pageNo <= MAX_PAGES) {
-  const page = await p.evaluate(() => {
-    const out = [];
-    let noFn = 0;
-    document.querySelectorAll("table.result-table-list tbody tr").forEach(tr => {
-      const a = tr.querySelector("a[data-filename]");
-      const ta = tr.querySelector("td.name a");
-      if (a) {
-        out.push({
-          f: a.getAttribute("data-filename"),
-          db: a.getAttribute("data-dbname") || "CJFQ",
-          title: ta ? (ta.textContent || "").trim() : ""
-        });
-      } else {
-        noFn++;
-      }
-    });
-    return { rows: out, noFn, totalTr: out.length + noFn };
-  });
-
-  page.rows.forEach(r => { r.page = pageNo; });
-  all.push(...page.rows);
-  skipped += page.noFn;
-
-  if (pageNo % 5 === 0 || pageNo === 1 || page.noFn > 0) {
-    // 打印本页文件名前缀（前 6 位），用于交叉核对期刊
-    const prefix = page.rows.length > 0 ? page.rows.map(r => r.f.slice(0, 4)).filter((v, i, a) => a.indexOf(v) === i).join("/") : "-";
-    console.log("  第 " + pageNo + " 页：可导出 " + page.rows.length
-      + " 条，跳过 " + page.noFn + " 条，累计 " + all.length + " ｜前缀 " + prefix);
-  }
-
-  if (page.totalTr === 0) {
-    console.log("  第 " + pageNo + " 页为空，停止");
-    break;
-  }
-
-  // 翻页：等「页码指示器」变化（比等第一行题名可靠）
-  const pBefore = await curPage();
-  const moved = await p.evaluate(() => {
-    const n = document.querySelector("#PageNext");
-    if (!n) return false;
-    if ((n.className || "").indexOf("disabled") >= 0) return false;
-    n.click();
-    return true;
-  });
-  if (!moved) {
-    console.log("  第 " + pageNo + " 页后无法翻页，停止");
-    break;
-  }
-
-  let changed = false;
-  for (let w = 0; w < 60; w++) {
-    await new Promise(r => setTimeout(r, 300));
-    const pNow = await curPage();
-    if (pNow && pNow !== pBefore) { changed = true; break; }
-  }
-  if (!changed) {
-    console.log("  ⚠️ 第 " + (pageNo + 1) + " 页页码未变化（" + pBefore + "），停止以免收错数据");
-    break;
-  }
-
-  pageNo++;
-}
-
-console.log("收集完成：可导出 " + all.length + " 条，跳过 " + skipped + " 条非期刊条目");
-if (all.length > 0) {
-  console.log("  首条:", all[0].f, all[0].db, all[0].title.slice(0, 30));
-}
-
-// 7. 写文件
-const fs = await import("node:fs");
-const path = await import("node:path");
-const dir = path.dirname(OUT);
-try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
-fs.writeFileSync(OUT, JSON.stringify(all, null, 1), "utf8");
-console.log("已写入:", OUT);

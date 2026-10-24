@@ -74,6 +74,46 @@ LY='价格理论与实践' AND YE=2020
 
 **检索结果每页 20 条。逐页读 `a[data-filename]` + `a[data-dbname]`，点 `#PageNext` 翻页。**
 
+## 公共模块 `scripts/ego_kit.js`
+
+**三个脚本共用这个模块，不要再各写一遍 `goto` / `evaluate` 样板。**
+
+**24 个导出函数，覆盖从开页面到收尾的全流程：**
+
+```
+开空间      openSpace / listSpace / finish / handOff
+检索        gotoExpert / readInstitution / fillQuery / submitSearch / readHitInfo
+滑块        checkCaptcha / assertNoCaptcha（三判据，不看 DOM 类名）
+读结果      readRows
+翻页        gotoNextPage
+导出        buildExportUrl / openExportPage / selectAllFields / selectAll /
+            downloadXls / waitForNewFile / snapshotDir
+诊断        shoot / diagnose / cdpProbe / makeLogger
+```
+
+**用到的 ego API（22 个）：**
+
+```
+page.cdp / click / evaluate / fetch / fill / goto / info / mouse /
+screenshot / snapshot / url / waitForEvent / waitForFunction / waitForSelector
+task.cdp / finish / handOff / newPage / page / pages / spaceId / tabs
+```
+
+**导入方式（ego 脚本走 stdin，没有相对路径基准，必须用绝对 `file:///`）：**
+
+```javascript
+const K = await import("file:///F:/工具/_外部技能库/cnki-export/scripts/ego_kit.js");
+```
+
+**⭐ 三个性能关键点（都是实测踩出来的）：**
+
+1. **翻页用 `evaluate` 里 `el.click()`，不要用 `page.click()`**——后者是 CDP 原生点击（滚动 + 算坐标 + 真实鼠标），实测每页慢 4 倍（5.2s vs 0.6—1.0s），28 页多花 80 秒。
+2. **等待用 `page.waitForFunction`（`polling: 100`），不要 `setTimeout` 轮询**——旧版 40 次 × 300ms，现在一步到位。
+3. **收尾用 `finish({keep: []})`，不要 `finish({keep: ["p1"]})`**——保留页面会把空间变成 `ownership: "user"`，下次同名 `taskSpace()` 直接报错 `A task space named "..." already exists and belongs to the user`，且 `takeOverTaskSpace` 需要用户批准，无法自动恢复。空间名建议带时间戳。
+4. **导出页必须等「字段区」渲染完再点全选**——只等 `#litoexcel` 时正文可能只有 618 字，字段区还没出来，`checkAllFields()` 找不到 `div.check-labels`，等于没勾，导出只有 5 列、没有摘要。
+
+---
+
 **脚本：`scripts/cnki_collect_filenames.js`**
 
 **⭐ 关键：`#PageNext` 是真正的下一页按钮。不要点 `a.adbutnext-btn`（那是广告）。**
@@ -113,12 +153,14 @@ https://kns.cnki.net/dm8/manage/export.html
 
 ```
 ① 点「全选」（全选字段，确保含 Summary-摘要）
-② 点「xls」（真实鼠标坐标，坐标通常约 (1009, 237)）
+② 点「xls」（`page.click("#litoexcel")`）
 ```
 
 **脚本：`scripts/cnki_export_batch.js`**
 
-**⭐ 关键：`xls` 按钮的 `getBoundingClientRect()` 是可见的，可以用 `page.mouse.click(x, y)` 直接点。**
+**⭐ 关键：`xls` 不是 `<a href=".xls">`，而是 `<li id="litoexcel" onclick="filetotext('xls')">`，里面套一个 `<a href="javascript:void(0)">`。用 `page.click("#litoexcel")` 一次命中，不需要坐标。**
+
+**⚠️ 踩过的坑：一开始用 `a[href*='.xls']` 找不到元素（`hasXls=false`），只好退回硬坐标 `mouse.click(1003, 237)`——分辨率一变就废。dump DOM 后才发现真实结构是带 `onclick` 的 `<li>`。**
 
 ### 第 5 步：找下载文件并合并
 

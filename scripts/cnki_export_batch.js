@@ -1,121 +1,151 @@
 /**
- * 导出知网文献为 xls（原生版，无滑块检测）
+ * cnki_export_batch.js —— 打开导出页，全选，导出 xls
  *
- * 由 Python 侧替换占位符：
+ * 占位符（由 cnki_export.py 替换）：
  *   __CNKI_FILENAMES__  已带库代码前缀的 filename 串（CJFQ!xxx,CJFQ!yyy,...）
- *   __CNKI_DL_DIR__     下载目录（用于核对新文件）
+ *   __CNKI_DL_DIR__     浏览器下载目录（核对新文件）
+ *   __CNKI_LOG__        日志绝对路径
+ *   __CNKI_SAVE_AS__    可选：直接落盘的绝对路径（空串则走浏览器下载）
+ *   __CNKI_SPACE__      ego 任务空间名
+ *
+ * 相比旧版的改进：
+ *   ① xls 不再硬点坐标 (1003,237)，改为三级降级：
+ *      page.fetch({saveAs}) → page.click(原生CDP) → page.mouse.click(坐标兜底)
+ *   ② 全选后不再固定 sleep，改用 page.waitForFunction 等勾选数 > 0
+ *   ③ 等下载用 fs 轮询 + 文件大小校验，不再盲等固定秒数
+ *   ④ 失败时截图取证
+ *
+ * 用到的 ego API（10 个）：
+ *   taskSpace, task.spaceId, task.page, task.finish
+ *   page.goto, page.waitForSelector, page.waitForFunction, page.click,
+ *   page.evaluate, page.fetch, page.mouse, page.screenshot
  */
+
+const K = await import("file:///F:/工具/_外部技能库/cnki-export/scripts/ego_kit.js");
+const fs = await import("node:fs");
+const path = await import("node:path");
 
 const FN = __CNKI_FILENAMES__;
 const DL_DIR = __CNKI_DL_DIR__;
-const EXPORT_BASE = "https://kns.cnki.net/dm8/manage/export.html";
+const LOG = __CNKI_LOG__;
+const SAVE_AS = __CNKI_SAVE_AS__;
+const SPACE = __CNKI_SPACE__;
 
-const fs = await import("node:fs");
+const L = K.makeLogger(LOG);
 
-console.log("filename 长度:", FN.length, "｜条数:", FN.split(",").length);
-console.log("下载目录:", DL_DIR);
+L.log("════ 导出开始 ════");
+L.log("filename 长度 " + FN.length + "，条数 " + FN.split(",").length);
+L.log("下载目录 " + DL_DIR);
+L.log("直存路径 " + (SAVE_AS || "（无，走浏览器下载）"));
 
-function snapshotDownloads() {
-  try {
-    return fs.readdirSync(DL_DIR).filter(x => x.toLowerCase().endsWith(".xls"));
-  } catch (e) {
-    return [];
-  }
-}
-const before = snapshotDownloads();
-console.log("导出前 xls 数量:", before.length);
+const items = FN.split(",").map((x) => {
+  const i = x.indexOf("!");
+  return i > 0 ? { db: x.slice(0, i), f: x.slice(i + 1) } : { db: "CJFQ", f: x };
+});
 
-// 打开导出页
-const t = await taskSpace("cnki-export");
-const p = t.page("p1");
-const url = EXPORT_BASE
-  + "?filename=" + encodeURIComponent(FN)
-  + "&displaymode=selfDefine&uniplatform=NZKPT";
-console.log("URL 长度:", url.length);
+let task = null;
+let page = null;
+let result = { ok: false, method: "", path: "", size: 0, error: "" };
 
 try {
-  await p.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-} catch (e) {
-  console.log("goto 提示:", String(e).slice(0, 100));
-}
-await new Promise(r => setTimeout(r, 6000));
+  const opened = await K.openSpace(SPACE, "p1", L);
+  task = opened.task;
+  page = opened.page;
 
-const info = await p.evaluate(() => {
-  const txt = document.body.innerText;
-  return {
-    title: document.title,
-    noData: txt.includes("暂无数据"),
-    len: txt.length,
-    hasXls: !!Array.from(document.querySelectorAll("a")).find(x => x.textContent.trim() === "xls")
-  };
-});
-console.log("页面状态:", JSON.stringify(info));
+  // 1. 构造导出 URL（含 414 预检）
+  const built = K.buildExportUrl(items);
+  L.log("URL 长度 " + built.url.length + "，条数 " + built.count);
+  if (built.url.length > 6000) {
+    throw new Error("URL " + built.url.length + " 字符，会 414。请把批次降到 200 条以内");
+  }
 
-if (info.noData) {
-  console.log("❗ 返回「暂无数据」——检查 filename 是否带 CJFQ! 前缀");
-  throw new Error("no data");
-}
-if (!info.hasXls) {
-  console.log("❗ 找不到 xls 按钮 —— 登录态可能失效");
-  throw new Error("no xls button");
-}
+  // 2. 打开导出页并等 xls 链接
+  const state = await K.openExportPage(page, built.url, { logger: L });
+  if (state.has414) throw new Error("414 Request-URI Too Large");
+  if (state.noData) throw new Error("导出页返回「暂无数据」——filename 缺 CJFQ! 前缀或条目无效");
+  if (!state.hasXls) L.log("  警告：未检出 xls 链接，仍尝试全选后导出");
 
-// 全选字段
-const sel = await p.evaluate(() => {
-  const e = Array.from(document.querySelectorAll("a, span"))
-    .find(x => x.textContent.trim() === "全选");
-  if (e) { e.click(); return "clicked"; }
-  return "not found";
-});
-console.log("全选字段:", sel);
-await new Promise(r => setTimeout(r, 1500));
+  // 3. 先勾全部 18 个导出字段（默认只勾 5 个，不勾就没有摘要）
+  await K.selectAllFields(page, { logger: L });
 
-// 点 xls
-const box = await p.evaluate(() => {
-  const e = Array.from(document.querySelectorAll("a"))
-    .find(x => x.textContent.trim() === "xls");
-  if (!e) return null;
-  const r = e.getBoundingClientRect();
-  return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), w: Math.round(r.width) };
-});
-console.log("xls 坐标:", JSON.stringify(box));
+  // 4. 再全选条目
+  await K.selectAll(page, { logger: L });
 
-if (box && box.w > 0) {
-  await p.mouse.click(box.x, box.y);
-  console.log("已点 xls");
-} else {
-  const r = await p.evaluate(() => {
-    const e = Array.from(document.querySelectorAll("a, li, span"))
-      .find(x => x.textContent.trim() === "xls");
-    if (!e) return "no element";
-    e.click();
-    return "fallback clicked " + e.tagName;
-  });
-  console.log("坐标点击失败，改元素点击:", r);
-}
+  // 4. 等勾选生效（替代固定 sleep）
+  try {
+    await page.waitForFunction(
+      () => {
+        const boxes = [...document.querySelectorAll("input[type='checkbox']")];
+        const checked = boxes.filter((b) => b.checked).length;
+        const txt = document.body ? document.body.innerText : "";
+        const m = txt.match(/已选\s*(\d+)/);
+        const selected = m ? Number(m[1]) : checked;
+        return selected > 0;
+      },
+      undefined,
+      { timeout: 15000, polling: 100 }
+    );
+    L.log("  勾选已生效");
+  } catch (e) {
+    L.log("  等勾选超时（可能默认全选）");
+  }
 
-// 等下载
-console.log("等待下载...");
-let added = [];
-for (let i = 0; i < 15; i++) {
-  await new Promise(r => setTimeout(r, 2000));
-  const after = snapshotDownloads();
-  added = after.filter(x => before.indexOf(x) < 0);
-  if (added.length > 0) break;
-}
+  // 5. 下载：fetch 直存 → click → mouse 兜底
+  const before = await K.snapshotDir(DL_DIR);
+  if (DL_DIR) L.log("  下载目录原有 " + before.size + " 个文件");
 
-if (added.length > 0) {
-  console.log("✅ 新增文件:");
-  added.forEach(f => {
-    try {
-      const st = fs.statSync(DL_DIR + "\\" + f);
-      console.log("   " + f + "  " + Math.round(st.size / 1024) + " KB");
-    } catch (e) {
-      console.log("   " + f);
+  const dl = await K.downloadXls(page, { saveAs: SAVE_AS || "", logger: L });
+  result.method = dl.method;
+
+  if (dl.method === "fetch" && dl.size > 1024) {
+    result.ok = true;
+    result.path = dl.path;
+    result.size = dl.size;
+    L.log("  直接落盘成功，无需等浏览器下载");
+  } else {
+    // 6. 等浏览器把文件写到下载目录
+    const p = await K.waitForNewFile(DL_DIR, before, { timeout: 45000, logger: L });
+    if (p) {
+      const st = fs.statSync(p);
+      result.ok = true;
+      result.path = p;
+      result.size = st.size;
+    } else {
+      throw new Error("等了 45 秒没有新 xls 文件");
     }
-  });
-} else {
-  console.log("⚠️ 没找到新文件");
-}
+  }
 
-console.log("DONE");
+  L.log("导出成功 method=" + result.method + " path=" + result.path +
+    " size=" + Math.round(result.size / 1024) + " KB");
+
+} catch (e) {
+  result.error = String(e).slice(0, 300);
+  L.log("❌ " + result.error);
+
+  if (page) {
+    try {
+      const shot = (LOG.replace(/\.log$/i, "")) + "_失败截图.png";
+      await K.shoot(page, shot, { fullPage: true, logger: L });
+      const d = await K.diagnose(page, {});
+      L.log("诊断 url=" + d.url + " title=" + d.info.title + " bodyLen=" + d.dom.bodyLen);
+    } catch (e2) {
+      L.log("取证失败 " + String(e2).slice(0, 100));
+    }
+  }
+} finally {
+  // 7. 结果写回日志旁（Python 侧读日志判断，不依赖 stdout）
+  try {
+    const rp = LOG.replace(/\.log$/i, "") + "_结果.json";
+    fs.writeFileSync(rp, JSON.stringify(result, null, 2), "utf8");
+    L.log("结果写入 " + rp);
+  } catch (e) {
+    L.log("结果写入失败 " + String(e).slice(0, 100));
+  }
+
+  if (task) {
+    const fin = await K.finish(task, []);
+    L.log("finish " + JSON.stringify(fin).slice(0, 150));
+  }
+
+  L.log("总耗时 " + L.elapsed() + "s" + (result.ok ? "" : "（失败）"));
+}

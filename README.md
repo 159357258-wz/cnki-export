@@ -116,6 +116,26 @@ python scripts/cnki_export.py --journal "价格理论与实践" --year 2020 --ou
 结果：560 条，0 重复，摘要 560/560 非空
 ```
 
+**同一刊同年用 `ego_kit.js` 重写后（2026-10-24 晚，全量实测）：**
+
+```
+收集 560 个文件名（28 页）      23.9 秒（每页 0.85 秒）
+导出 3 批（200+200+160）        4.4 + 3.8 + 3.9 = 12.2 秒
+合并 + 分类 + 写 CSV            0.1 秒
+────────────────────────────────────────────────
+全流程                          37.1 秒
+
+结果：560 条，0 重复，摘要 560/560 非空，18 列齐全
+```
+
+**⭐ 快了 3.1 倍（115 → 37.1 秒）。三处改动带来这个差距：**
+
+| 改动 | 效果 |
+|---|---|
+| 翻页：`setTimeout` 轮询 → `evaluate` 点击 + `waitForFunction` | 每页 1.3s → 0.85s |
+| 检索：固定 sleep 17s → `waitForFunction` 等结果行 | 17s → 1.1s |
+| 导出：硬坐标 → `page.click("#litoexcel")` + 字段全选 | 47.4s → 12.2s，且 18 列含摘要 |
+
 **《中国工业经济》2020 年：**
 
 ```
@@ -196,6 +216,10 @@ ISSN-国际标准刊号  URL-网址  DOI-DOI
 | **环境变量传不进脚本** | `process.env.X` 是 `undefined`，脚本静默用默认值 | **用模板替换占位符**，不要用 env |
 | **命中数 ≠ 可导出数** | 命中 146 只收到 129 | **正常**：会议记录/视频无 `data-filename`，脚本会报「跳过 N 条」 |
 | **一次导 500 条报 414** | `414 Request-URI Too Large`（URL 10591 字符） | 按 **200 一批**。实测 200 ✅ / 300 ❌400 / 500 ❌414 |
+| **xls 按钮找不到** | hasXls=false，[href*='.xls'] 无匹配 | 真实结构是 <li id="litoexcel" onclick="filetotext('xls')">，用 page.click("#litoexcel") |
+| **导出的 xls 只有 5 列、没摘要** | 14.7 KB / 40 条 | 导出页默认只勾前 5 个字段；调 checkAllFields(true) 勾全 18 个，**但必须先等字段区渲染完**（等 div.check-labels input ≥ 10 且正文 > 1000 字） |
+| **	askSpace 报「already exists and belongs to the user」** | 上一次 inish({keep:["p1"]}) 保留了页面 | 改成 inish({keep: []}) 关闭空间，空间名带时间戳 |
+| **翻页改用 page.click("#PageNext") 后反而慢 4 倍** | 每页 5.2s（原 1.3s） | page.click 是 CDP 原生点击（滚动+坐标+真实鼠标）；改用 valuate 里 l.click()，等待交给 waitForFunction |
 | **翻页用「第一行题名变化」判断会串数据** | 收集 469 条，中间混进别的期刊（`GGYY` 前缀） | 改等「**页码指示器**」变化（`1/28`→`2/28`），并打印每页文件名前缀交叉核对 |
 | **`console.log` 在 ego-browser 里被完全缓冲** | `cmd /c "> out.txt"` 拿到的文件始终 0 字节，看不到进度 | 脚本里改用 `fs.appendFileSync` 直接写日志文件 |
 

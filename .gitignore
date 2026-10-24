@@ -5,3 +5,5 @@ __pycache__/
 filenames.json
 batch_*.txt
 .DS_Store
+
+scripts/_run/

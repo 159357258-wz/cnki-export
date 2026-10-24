@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 import pandas as pd
@@ -120,12 +121,32 @@ def run_ego(ego, script_path, replacements, timeout=1800, label=""):
     for k, v in replacements.items():
         script = script.replace(k, v)
 
+    # 检查是否还有未替换的占位符（旧版曾因 env 不继承而静默用默认值）
+    left = sorted(set(re.findall(r"__CNKI_[A-Z_]+__", script)))
+    if left:
+        raise SystemExit("❗ 未替换的占位符：%s（检查 replacements 与脚本里的名字是否一致）" % left)
+
+    # ⚠️ 为什么写到临时 .mjs 而不是 -e 内联：
+    #   ① 内联脚本受 Windows 命令行长度限制（约 32KB），长脚本会被截断
+    #   ② 脚本要 import ego_kit.js，内联模式没有稳定的模块基准路径
+    #   ③ -e 里只放一行 ASCII 的 import 入口，避开引号与中文转义问题
+    work = os.path.join(os.path.dirname(script_path), "_run")
+    os.makedirs(work, exist_ok=True)
+    # label 里可能有 / : 等非法文件名字符（如「导出第 1/1 批」），先清洗
+    safe = re.sub(r"[^\w\u4e00-\u9fa5\-]+", "_", (label or "run"))[:40].strip("_") or "run"
+    mjs = os.path.join(work, "step_%s.mjs" % safe)
+    with open(mjs, "w", encoding="utf-8") as f:
+        f.write(script)
+
+    entry = "await import('file:///%s')" % mjs.replace("\\", "/")
+
     if label:
-        print("  [启动] %s（脚本 %d 字符，超时 %d 秒）" % (label, len(script), timeout))
+        print("  [启动] %s（脚本 %d 字符 → %s，超时 %d 秒）"
+              % (label, len(script), os.path.basename(mjs), timeout))
 
     t0 = time.time()
     proc = subprocess.Popen(
-        [ego, "nodejs", "-e", script],
+        [ego, "nodejs", "-e", entry],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="ignore",
@@ -166,8 +187,12 @@ def step_check(ego, journal, year, out_dir):
     script = os.path.join(os.path.dirname(__file__), "cnki_check.js")
     if not os.path.isfile(script):
         raise SystemExit("❗ 缺少 %s" % script)
-    code, out, err = run_ego(ego, script, {"__CNKI_QUERY__": js_str(query)},
-                             timeout=180, label="自检")
+    stamp = time.strftime("%H%M%S")
+    code, out, err = run_ego(ego, script, {
+        "__CNKI_QUERY__": js_str(query),
+        "__CNKI_LOG__": js_str(os.path.join(out_dir, "自检_%s.log" % stamp)),
+        "__CNKI_SPACE__": js_str("cnki-check-" + stamp),
+    }, timeout=180, label="自检")
     if code != 0:
         raise SystemExit("❗ 自检失败（退出码 %d）" % code)
     print("\n✅ 自检通过")
@@ -186,10 +211,13 @@ def step1_collect(ego, journal, year, out_dir, max_pages=0):
     query = "LY='%s' AND YE=%s" % (journal, year)
     print("  检索式:", query)
     script = os.path.join(os.path.dirname(__file__), "cnki_collect_filenames.js")
+    stamp = time.strftime("%H%M%S")
     code, out, err = run_ego(ego, script, {
         "__CNKI_QUERY__": js_str(query),
         "__CNKI_OUT__": js_str(fj),
-        "const MAX_PAGES = 80;": "const MAX_PAGES = %d;" % (max_pages if max_pages else 80),
+        "__CNKI_LOG__": js_str(os.path.join(out_dir, "收集_%s.log" % stamp)),
+        "__CNKI_MAX_PAGES__": str(max_pages if max_pages else 80),
+        "__CNKI_SPACE__": js_str("cnki-collect-" + stamp),
     }, timeout=900, label="收集文件名")
     if code != 0:
         if "滑块" in out or "验证" in out:
@@ -220,9 +248,13 @@ def step2_export(ego, data, dl_dir, out_dir, dry_run=False):
         open(ff, "w", encoding="utf-8").write(fn)
 
         before = set(glob.glob(os.path.join(dl_dir, "*.xls")))
+        stamp = time.strftime("%H%M%S")
         code, out, err = run_ego(ego, script, {
             "__CNKI_FILENAMES__": js_str(fn),
             "__CNKI_DL_DIR__": js_str(dl_dir),
+            "__CNKI_LOG__": js_str(os.path.join(out_dir, "导出_%d_%s.log" % (bi, stamp))),
+            "__CNKI_SAVE_AS__": js_str(""),
+            "__CNKI_SPACE__": js_str("cnki-export-%d-%s" % (bi, stamp)),
         }, timeout=300, label="导出第 %d/%d 批" % (bi, len(batches)))
 
         # 找新文件
@@ -384,11 +416,15 @@ def main():
         data = json.load(open(fj, encoding="utf-8"))
         print("\n【复用】从 %s 读到 %d 条，跳过收集" % (fj, len(data)))
     else:
+        _t_col = time.time()
         data = step1_collect(ego, args.journal, args.year, args.out,
                              max_pages=args.max_pages)
+        print("\n  [计时] 收集阶段 %.1f 秒" % (time.time() - _t_col))
 
     # ── 导出阶段
+    _t_exp = time.time()
     files = step2_export(ego, data, dl, args.out, dry_run=args.dry_run)
+    print("\n  [计时] 导出阶段 %.1f 秒" % (time.time() - _t_exp))
 
     if args.dry_run or args.max_pages:
         print("\n自检完成。检查上面是否有「新增 xls」——有就说明流程通了。")
@@ -403,7 +439,9 @@ def main():
     if len(files) < expect:
         print("\n⚠️ 预期 %d 批，实际只导到 %d 批 —— 合并结果是部分数据" % (expect, len(files)))
 
+    _t_merge = time.time()
     step3_merge(files, args.journal, args.year, args.out)
+    print("\n  [计时] 合并阶段 %.1f 秒" % (time.time() - _t_merge))
 
 
 if __name__ == "__main__":
