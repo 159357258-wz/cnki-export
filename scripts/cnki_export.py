@@ -40,7 +40,21 @@ import time
 
 import pandas as pd
 
-BATCH_LIMIT = 200  # 每批条数上限（实测：500 条 → 414 Request-URI Too Large；
+# 每批条数。三档都实测过：
+#   100 条 → 0 次验证码（连续 6 批验证过两次），唯一稳定档
+#   200 条 → 触发点阵验证码「请依次点击【的、点】」（多次复现）
+#   250 条 → 触发，且 xls 生成要 20 秒/批（100 条只要 2.7 秒）
+# 所以锁定 100。代价是批数多（560 条要 6 批），需配 BATCH_GAP_SEC 避免撞「按次限速」
+#   （不限速时 6 批共 16 秒；连着跑会被限速，后几批各 20+ 秒）
+BATCH_LIMIT = 100
+
+# 批间间隔（秒）。100 条/批时若不间隔，后几批会被知网限速（各 20+ 秒）；
+# 留 5 秒让限速窗口过去，比被限速更快。
+BATCH_GAP_SEC = 5
+# ⚠️ 为什么是 100 不是 200：实测 200 条/批会**概率性触发点阵验证码**
+#    （弹窗「请完成安全验证 / 请依次点击【的、点】」，截图见 _校验/captcha_batch*.png），
+#    触发后该批 45 秒内拿不到文件、整轮失败。改成 100 条/批后连续 6 批 0 次验证码，
+#    且每批更快（2.7 秒 vs 4 秒）。原 200 的限制来自 URL 长度（500 条 → 414 Request-URI Too Large；
                    #                    300 条 → HTTP 400 Bad Request；
                    #                    200 条 → OK，URL 约 4291 字符）
 
@@ -238,15 +252,31 @@ def step2_export(ego, data, dl_dir, out_dir, dry_run=False):
     batches = [data[i:i + BATCH_LIMIT] for i in range(0, len(data), BATCH_LIMIT)]
     print("\n【第 2 步】分 %d 批导出（每批 ≤%d 条）" % (len(batches), BATCH_LIMIT))
 
-    script = os.path.join(os.path.dirname(__file__), "cnki_export_batch.js")
-    downloaded = []
-
+    # ⚠️ 为什么并发：3 批串行时，某批碰上网络慢会连带拖住后面
+    #    （实测第 2、3 批各 23.8 秒，导出阶段 51.8 秒）。
+    #    并发后每批一个 Page，总耗时≈最慢那批。
+    batch_strs = []
     for bi, batch in enumerate(batches, 1):
-        print("\n  ── 第 %d/%d 批（%d 条）──" % (bi, len(batches), len(batch)))
         fn = ",".join([(d.get("db") or "CJFQ") + "!" + d["f"] for d in batch])
         ff = os.path.join(out_dir, "batch_%d.txt" % bi)
         open(ff, "w", encoding="utf-8").write(fn)
+        batch_strs.append(fn)
+        print("  批 %d: %d 条，filename %d 字符" % (bi, len(batch), len(fn)))
 
+    before = set(glob.glob(os.path.join(dl_dir, "*.xls")))
+    stamp = time.strftime("%H%M%S")
+    use_multi = False   # 并发导出会丢文件（同一下载目录互相覆盖），实测 3 批只剩 2 个
+
+    # 串行逐批导出。
+    # ⚠️ 不并发：3 个 Page 同时下载到同一个目录会互相覆盖，
+    #    实测 3 批只剩 2 个文件（丢 200 条）。
+    # ⚠️ 不用 page.waitForEvent("download")：知网 xls 不是标准 download，
+    #    实测会干等 60 秒超时（导出变成 117 秒）。仍用目录轮询。
+    script = os.path.join(os.path.dirname(__file__), "cnki_export_batch.js")
+    downloaded = []
+
+    for bi, fn in enumerate(batch_strs, 1):
+        print("\n  ── 第 %d/%d 批（%d 条）──" % (bi, len(batch_strs), len(batch_strs) and len(fn.split(","))))
         before = set(glob.glob(os.path.join(dl_dir, "*.xls")))
         stamp = time.strftime("%H%M%S")
         code, out, err = run_ego(ego, script, {
@@ -254,10 +284,11 @@ def step2_export(ego, data, dl_dir, out_dir, dry_run=False):
             "__CNKI_DL_DIR__": js_str(dl_dir),
             "__CNKI_LOG__": js_str(os.path.join(out_dir, "导出_%d_%s.log" % (bi, stamp))),
             "__CNKI_SAVE_AS__": js_str(""),
-            "__CNKI_SPACE__": js_str("cnki-export-%d-%s" % (bi, stamp)),
-        }, timeout=300, label="导出第 %d/%d 批" % (bi, len(batches)))
+            # ⚠️ 6 批共用一个空间名：每批新建 taskSpace 会让浏览器分配新渲染进程、
+            #    缓存不复用，导出页首次加载要 20—40 秒；共用空间后每批约 2—4 秒。
+            "__CNKI_SPACE__": js_str("cnki-export-shared-" + stamp),
+        }, timeout=300, label="导出第 %d/%d 批" % (bi, len(batch_strs)))
 
-        # 找新文件
         deadline = time.time() + 30
         new_files = []
         while time.time() < deadline:
@@ -265,15 +296,19 @@ def step2_export(ego, data, dl_dir, out_dir, dry_run=False):
             new_files = sorted(after - before, key=os.path.getmtime, reverse=True)
             if new_files:
                 break
-            time.sleep(2)
+            time.sleep(0.3)
 
         if new_files:
             print("  ✅ 新增: %s（%d KB）" % (
-                os.path.basename(new_files[0]),
-                os.path.getsize(new_files[0]) // 1024))
+                os.path.basename(new_files[0]), os.path.getsize(new_files[0]) // 1024))
             downloaded.append(new_files[0])
         else:
             print("  ⚠️ 这批没拿到新文件")
+
+        # 批间间隔：100 条/批时不间隔会被限速（后几批各 20+ 秒）
+        if bi < len(batch_strs) and BATCH_GAP_SEC > 0:
+            print("  …等待 %d 秒（避开限速窗口）" % BATCH_GAP_SEC)
+            time.sleep(BATCH_GAP_SEC)
 
     return downloaded
 

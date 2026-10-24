@@ -65,7 +65,10 @@ try {
   // 6. 检索并等结果（click + waitForFunction）
   await K.submitSearch(page, { logger: L });
 
-  // 7. 命中信息
+  // 6.5 切到 50 条/页（页数从 28 减到 12，收集时间减半）
+  await K.setPerPage(page, 50, { logger: L });
+
+  // 7. 命中信息（切换后页码会重置为 1/N，N 是新的总页数）
   const hit = await K.readHitInfo(page);
   L.log("命中 " + hit.total + " 条 / " + hit.pageCount + " 页");
   if (!hit.total || hit.total === "0") throw new Error("检索无结果");

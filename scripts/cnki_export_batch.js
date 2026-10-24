@@ -52,18 +52,12 @@ try {
   task = opened.task;
   page = opened.page;
 
-  // 1. 构造导出 URL（含 414 预检）
-  const built = K.buildExportUrl(items);
-  L.log("URL 长度 " + built.url.length + "，条数 " + built.count);
-  if (built.url.length > 6000) {
-    throw new Error("URL " + built.url.length + " 字符，会 414。请把批次降到 200 条以内");
-  }
-
-  // 2. 打开导出页并等 xls 链接
-  const state = await K.openExportPage(page, built.url, { logger: L });
-  if (state.has414) throw new Error("414 Request-URI Too Large");
+  // 1. 用 POST 提交（绕开 GET 的 URL 长度限制：GET 250 条可、300 条 400、500 条 414）
+  L.log("条数 " + items.length);
+  const state = await K.openExportPagePost(page, items, { logger: L });
   if (state.noData) throw new Error("导出页返回「暂无数据」——filename 缺 CJFQ! 前缀或条目无效");
-  if (!state.hasXls) L.log("  警告：未检出 xls 链接，仍尝试全选后导出");
+  if (state.hasCaptcha) throw new Error("触发点阵验证码，需人工处理后再跑（本批 " + items.length + " 条）");
+  if (!state.hasXls) throw new Error("导出页无 xls 按钮（fields=" + state.fields + "）");
 
   // 3. 先勾全部 18 个导出字段（默认只勾 5 个，不勾就没有摘要）
   await K.selectAllFields(page, { logger: L });
@@ -142,8 +136,9 @@ try {
     L.log("结果写入失败 " + String(e).slice(0, 100));
   }
 
+  // ⚠️ 保留 p1，让下一批复用同一空间的缓存（不保留会关闭空间，下批又要冷启动）
   if (task) {
-    const fin = await K.finish(task, []);
+    const fin = await K.finish(task, ["p1"]);
     L.log("finish " + JSON.stringify(fin).slice(0, 150));
   }
 

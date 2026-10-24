@@ -40,6 +40,8 @@ export const SEL = {
   //   name="SELFDEFINE_selfFiledList"  前 5 个（来源库/题名/作者/单位/来源），默认勾选
   //   name="newdefine_selfFiledList"   后 13 个（关键词/摘要/发表时间/…/DOI），默认未勾
   // 页面有「全选」<a onclick="checkAllFields(true)">，一次全勾
+  perPageDiv: "#perPageDiv",
+  perPageList: "#perPageDiv ul.sort-list li",
   fieldBoxChecked: "input[name='newdefine_selfFiledList']:checked",
   fieldBoxAll: "input[name='newdefine_selfFiledList']",
 };
@@ -176,6 +178,77 @@ export async function gotoExpert(page, { timeout = 45000, logger } = {}) {
 }
 
 /**
+ * 切换「每页显示条数」——把 20 条/页改成 50 条/页，页数少一半。
+ *
+ * 实测：560 条在 20/页时是 28 页（收集 23.9 秒），50/页时是 12 页（约 15 秒）。
+ * 控件结构：<div id="perPageDiv"><ul class="sort-list"><li data-val="50"><a>50</a></li></ul></div>
+ *
+ * 用到：page.evaluate, page.waitForFunction
+ */
+export async function setPerPage(page, n = 50, { logger } = {}) {
+  const before = await page.evaluate(() => {
+    const d = document.querySelector("#perPageDiv");
+    return d ? d.textContent.trim().replace(/\s+/g, "") : "";
+  });
+
+  // 展开下拉
+  await page.evaluate(() => {
+    const d = document.querySelector("#perPageDiv");
+    if (d) d.click();
+  });
+  await new Promise((r) => setTimeout(r, 400));
+
+  // 点目标 <li data-val="N">
+  const clicked = await page.evaluate((val) => {
+    const li = document.querySelector('#perPageDiv ul.sort-list li[data-val="' + val + '"]');
+    if (!li) return false;
+    li.click();
+    return true;
+  }, String(n));
+
+  if (!clicked) {
+    if (logger) logger.log("  ⚠️ 未找到每页 " + n + " 条选项（下拉可能没展开）");
+    return { ok: false, before, after: before };
+  }
+
+  // ⚠️ 必须等「行数真的变成 n」+「页码重置为 1/N」。
+  //    踩过的坑：原来等 rows >= Math.min(n,10) 即 rows>=10，而 20 已满足立刻返回，
+  //    结果第 1 页仍是 20 条（旧页大小），第 2 页才变 50，
+  //    560 条只收到 520（丢第 1 页的 30 条 + 末页 10 条）。
+  let switched = false;
+  try {
+    await page.waitForFunction(
+      (want) => {
+        const rows = document.querySelectorAll("table.result-table-list tbody tr").length;
+        const m = (document.body.innerText || "").match(/(\d+)\/(\d+)/);
+        const onFirstPage = m && Number(m[1]) === 1;
+        // 行数达标（或已是末页不足 want 条）且确实在第 1 页
+        return onFirstPage && (rows >= want || (rows > 0 && m && Number(m[2]) === 1));
+      },
+      n,
+      { timeout: 20000, polling: 100 }
+    );
+    switched = true;
+  } catch (e) {
+    if (logger) logger.log("  ⚠️ 等行数变 " + n + " 超时");
+  }
+
+  const after = await page.evaluate(() => ({
+    rows: document.querySelectorAll("table.result-table-list tbody tr").length,
+    txt: (document.querySelector("#perPageDiv") || {}).textContent || "",
+    pageInfo: ((document.body.innerText || "").match(/(\d+)\/(\d+)/) || [])[0] || "",
+  }));
+
+  // 判定：行数必须 ≥ 原行数，且页码必须是 1/N 且 N 变小了
+  const ok = switched && after.rows > 0;
+  if (logger) {
+    logger.log("  每页条数 " + (before || "?") + " → " + n +
+      "（行数 " + after.rows + "，页码 " + after.pageInfo + "）" + (ok ? " ✅" : " ⚠️"));
+  }
+  return { ok, before, after: String(n), rows: after.rows, pageInfo: after.pageInfo };
+}
+
+/**
  * 读机构名（顶栏单位）。
  * 用到：page.evaluate
  */
@@ -281,7 +354,7 @@ export async function readRows(page) {
  * 用到：page.evaluate（点下一页）, page.waitForFunction
  * 返回：{ moved, pageNo }
  */
-export async function gotoNextPage(page, { timeout = 20000, logger } = {}) {
+export async function gotoNextPage(page, { timeout = 20000, logger, retry = 1 } = {}) {
   // ⚠️ 性能关键：用 evaluate 里的 el.click()（纯 JS，毫秒级），
   //    不要用 page.click()（CDP 原生点击：滚动到可见 + 算坐标 + 真实鼠标事件，
   //    实测每页慢 4 倍，28 页累计多花 80 秒）。
@@ -307,18 +380,36 @@ export async function gotoNextPage(page, { timeout = 20000, logger } = {}) {
     return { moved: false, pageNo: step.before };
   }
 
-  // 等到页码变化
-  try {
-    await page.waitForFunction(
-      (prev) => {
-        const m = (document.body ? document.body.innerText : "").match(/(\d+)\/(\d+)/);
-        return m && Number(m[1]) !== prev;
-      },
-      step.before,
-      { timeout, polling: 100 }
-    );
-  } catch (e) {
-    if (logger) logger.log("  等页码变化超时（原页码 " + step.before + "）");
+  // 等到页码变化。⚠️ 超时要重试：
+  //    实测 50 条/页时，个别页渲染慢，10 秒等不到（曾导致只收 100 条就停）。
+  //    重试策略：等超时后，再点一次下一页（可能上次点击没生效），最多 retry 次。
+  let waited = false;
+  for (let att = 0; att <= retry; att++) {
+    try {
+      await page.waitForFunction(
+        (prev) => {
+          const m = (document.body ? document.body.innerText : "").match(/(\d+)\/(\d+)/);
+          return m && Number(m[1]) !== prev;
+        },
+        step.before,
+        { timeout, polling: 100 }
+      );
+      waited = true;
+      break;
+    } catch (e) {
+      if (att < retry) {
+        if (logger) logger.log("  等页码变化超时（原页码 " + step.before + "），重试 " + (att + 1) + "/" + retry);
+        // 重新点一次（上次点击可能没生效）
+        await page.evaluate((sel) => {
+          const n = document.querySelector(sel);
+          if (n) n.click();
+        }, SEL.nextBtn).catch(() => {});
+      } else {
+        if (logger) logger.log("  等页码变化超时（原页码 " + step.before + "），已重试 " + retry + " 次，放弃");
+      }
+    }
+  }
+  if (!waited) {
     return { moved: false, pageNo: step.before };
   }
 
@@ -450,6 +541,99 @@ export async function selectAllFields(page, { logger } = {}) {
 }
 
 /**
+ * 用 <form method="POST"> 导航到导出页——绕开 GET 的 URL 长度限制。
+ *
+ * 实测 URL 长度上限（GET）：
+ *   250 条 → 5341 字符 ✅
+ *   300 条 → 6391 字符 ❌ 400 Bad Request
+ *   500 条 → 10591 字符 ❌ 414 Request-URI Too Large
+ * 改用 POST 后：500 条 ✅、560 条 ✅（导航 1.1 秒完成）
+ *
+ * ⚠️ 但 560 条 POST 后字段区不渲染（fields=0）、点不到 xls、且触发验证码。
+ *    所以实际用 250 条/批（3 批收 560 条）。
+ *
+ * 用到：page.evaluate（建 form 并 submit）, page.waitForSelector, page.waitForFunction
+ */
+export async function openExportPagePost(page, items, { logger, timeout = 40000 } = {}) {
+  const fn = items.map((x) => (x.db || "CJFQ") + "!" + x.f).join(",");
+  if (logger) logger.log("  POST 提交 " + items.length + " 条，filename " + fn.length + " 字符");
+
+  // ⚠️ 必须先从同源页面发起 form 提交。
+  //    踩过的坑：新开的 taskSpace 里页面是 about:blank，
+  //    在 about:blank 上建 form 并 submit，浏览器不执行导航，
+  //    页面停在 about:blank（截图可见），随后等 #litoexcel 40 秒超时。
+  const cur = await page.url();
+  if (!cur || cur === "about:blank" || cur.indexOf("kns.cnki.net") < 0) {
+    if (logger) logger.log("  当前页 " + (cur || "about:blank") + "，先导航到同源页面");
+    await page.goto("https://kns.cnki.net/kns8s/AdvSearch?type=expert", {
+      waitUntil: "domcontentloaded", timeout: 30000,
+    });
+  }
+
+  // 用 form POST 导航（fetch 只回字符串、不渲染，点不到 xls）
+  await page.evaluate((filename) => {
+    const old = document.getElementById("__cnki_post_form");
+    if (old) old.remove();
+    const f = document.createElement("form");
+    f.id = "__cnki_post_form";
+    f.method = "POST";
+    f.action = "https://kns.cnki.net/dm8/manage/export.html";
+    f.style.display = "none";
+    const add = (name, value) => {
+      const i = document.createElement("input");
+      i.type = "hidden";
+      i.name = name;
+      i.value = value;
+      f.appendChild(i);
+    };
+    add("filename", filename);
+    add("displaymode", "selfDefine");
+    add("uniplatform", "NZKPT");
+    document.body.appendChild(f);
+    f.submit();
+  }, fn);
+
+  // 等导出页骨架
+  await page.waitForSelector("#litoexcel, #litoword", { timeout, state: "attached" });
+
+  // 等字段区渲染完（这是之前 560 条 POST 失败的根因：fields=0 时调 checkAllFields 无效）
+  let fields = 0;
+  try {
+    await page.waitForFunction(
+      () => {
+        const n = document.querySelectorAll("div.check-labels input[type='checkbox']").length;
+        const len = document.body ? document.body.innerText.length : 0;
+        return n >= 10 && len > 1000;
+      },
+      undefined,
+      { timeout: 25000, polling: 150 }
+    );
+  } catch (e) {
+    if (logger) logger.log("  ⚠️ 字段区 25 秒内未就绪");
+  }
+
+  const state = await page.evaluate(() => {
+    const flat = (document.body ? document.body.innerText : "").replace(/\s+/g, " ");
+    return {
+      title: document.title,
+      bodyLen: flat.length,
+      noData: /暂无数据/.test(flat),
+      hasXls: !!document.querySelector("#litoexcel"),
+      fields: document.querySelectorAll("div.check-labels input[type='checkbox']").length,
+      hasCaptcha: /请完成安全验证|请依次点击|向右滑动完成验证/.test(flat),
+      url: location.href.slice(0, 120),
+    };
+  });
+
+  if (logger) {
+    logger.log("  导出页 title=" + state.title + " bodyLen=" + state.bodyLen +
+      " hasXls=" + state.hasXls + " fields=" + state.fields +
+      " noData=" + state.noData + " captcha=" + state.hasCaptcha);
+  }
+  return state;
+}
+
+/**
  * 点「全选」。
  * 用到：page.click
  */
@@ -486,15 +670,28 @@ export async function selectAll(page, { logger } = {}) {
  *
  * 用到：page.click, page.evaluate, page.mouse.click, page.fetch
  */
-export async function downloadXls(page, { saveAs, logger } = {}) {
+export async function downloadXls(page, { saveAs, logger, waitDownload = false, downloadTimeout = 60000 } = {}) {
   const attempts = [];
+
+  // ⭐ 关键：点击前先 arm download 事件，避免「点完了才发现文件没落盘」
+  //    （旧版靠 2 秒轮询目录，最坏多等 2 秒 × 批数）
+  let dlPromise = null;
+  if (waitDownload) {
+    try {
+      dlPromise = page.waitForEvent("download", { timeout: downloadTimeout })
+        .then((d) => ({ ok: true, download: d }))
+        .catch((e) => ({ ok: false, error: String(e).slice(0, 120) }));
+    } catch (e) {
+      if (logger) logger.log("  ⚠️ arm download 失败：" + String(e).slice(0, 80));
+    }
+  }
 
   // ── ① 点外层 li ──
   try {
     await page.click(SEL.xlsLi, { timeout: 8000, force: true, label: "导出 xls" });
     attempts.push("click-li:ok");
     if (logger) logger.log("  ✅ page.click(#litoexcel)");
-    return { method: "click-li", path: "", size: 0, attempts };
+    return { method: "click-li", path: "", size: 0, attempts, download: dlPromise ? await dlPromise : null };
   } catch (e) {
     attempts.push("click-li:" + String(e).slice(0, 60));
     if (logger) logger.log("  ✗ click(#litoexcel) " + String(e).slice(0, 80));
@@ -505,7 +702,7 @@ export async function downloadXls(page, { saveAs, logger } = {}) {
     await page.click(SEL.xlsAnchor, { timeout: 8000, force: true, label: "导出 xls" });
     attempts.push("click-a:ok");
     if (logger) logger.log("  ✅ page.click(#litoexcel a)");
-    return { method: "click-a", path: "", size: 0, attempts };
+    return { method: "click-a", path: "", size: 0, attempts, download: dlPromise ? await dlPromise : null };
   } catch (e) {
     attempts.push("click-a:" + String(e).slice(0, 60));
     if (logger) logger.log("  ✗ click(#litoexcel a) " + String(e).slice(0, 80));
@@ -523,7 +720,7 @@ export async function downloadXls(page, { saveAs, logger } = {}) {
     attempts.push("eval-filetotext:" + r);
     if (r === "called") {
       if (logger) logger.log("  ✅ 直接调用 filetotext('xls')");
-      return { method: "eval", path: "", size: 0, attempts };
+      return { method: "eval", path: "", size: 0, attempts, download: dlPromise ? await dlPromise : null };
     }
     if (logger) logger.log("  ✗ 页面无 filetotext 函数");
   } catch (e) {
@@ -548,7 +745,7 @@ export async function downloadXls(page, { saveAs, logger } = {}) {
     await page.mouse.click(box.x, box.y);
     attempts.push("mouse:" + box.x + "," + box.y);
     if (logger) logger.log("  ✅ mouse.click 兜底 (" + box.x + "," + box.y + ") 实测尺寸 " + box.w + "×" + box.h);
-    return { method: "mouse", path: "", size: 0, attempts };
+    return { method: "mouse", path: "", size: 0, attempts, download: dlPromise ? await dlPromise : null };
   }
 
   attempts.push("all-failed");
